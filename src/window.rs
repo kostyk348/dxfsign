@@ -1215,8 +1215,8 @@ pub fn run(
         });
         CTX = Box::into_raw(c);
 
-        let mut wtitle = Vec::with_capacity(title.len() + 24);
-        wtitle.extend_from_slice(b"DXFSIGN \xe2\x80\x94 ");
+        let mut wtitle = Vec::with_capacity(title.len() + 32);
+        wtitle.extend_from_slice(format!("DXFSIGN {} — ", crate::VERSION).as_bytes());
         wtitle.extend_from_slice(title.as_bytes());
         wtitle.push(0);
 

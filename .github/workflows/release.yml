@@ -1,0 +1,68 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- сборка для Windows 10/11 (stable, MSVC)
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --offline
+      - name: Build win64
+        run: cargo build --release --offline
+      - name: Stage win64
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Copy-Item target/release/dxfsign.exe "dxfsign-$v-win64.exe"
+          ./target/release/dxfsign.exe --version
+
+      # --- сборка для Windows 7 (rustc 1.77.2 + MinGW)
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+      - name: Add rustc 1.77.2 with gnu target
+        run: |
+          rustup toolchain install 1.77.2 --profile minimal
+          rustup target add x86_64-pc-windows-gnu --toolchain 1.77.2
+      - name: Build win7
+        run: cargo +1.77.2 build --release --offline --target x86_64-pc-windows-gnu
+      - name: Stage win7
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Copy-Item target/x86_64-pc-windows-gnu/release/dxfsign.exe "dxfsign-$v-win7-x64.exe"
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dxfsign-*.exe | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Publish assets to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notlike "v*") { $tag = "v" + (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value }
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "dxfsign $tag" --generate-notes
+          }
+          gh release upload $tag dxfsign-*.exe SHA256SUMS.txt --clobber
+          gh release view $tag --json assets --jq '.assets[] | "\(.name) \(.size) \(.state)"'

@@ -9,3 +9,5 @@ _VERSIONS/
 *.edited.dxf
 *.changes.txt
 dxfsign.ini
+
+dist/

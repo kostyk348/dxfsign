@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests (stable)
+        run: cargo test --offline --verbose
+      - name: Release build (stable)
+        run: cargo build --release --offline
+      - name: Version stamp
+        run: ./target/release/dxfsign.exe --version
+      - name: SnapshotUI smoke
+        run: |
+          ./target/release/dxfsign.exe snapshot examples/shield.dxf --out frame.bmp --w 1280 --h 800
+          ./target/release/dxfsign.exe open --selftest 800

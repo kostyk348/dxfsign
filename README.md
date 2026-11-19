@@ -6,6 +6,18 @@
 
 Один исполняемый файл, **ноль зависимостей**, без .NET и VC++ redist.
 
+**Версия 1.0.0** — [скачать сборку](../../releases/latest):
+
+| Файл | Для чего |
+|---|---|
+| `dxfsign-1.0.0-win64.exe` | Windows 10 / 11 |
+| `dxfsign-1.0.0-win7-x64.exe` | Windows 7 SP1 (нужен KB2999226, Universal C Runtime) |
+| `SHA256SUMS.txt` | контрольные суммы; проверка: `certutil -hashfile <файл> SHA256` |
+
+```bat
+dxfsign.exe --version
+```
+
 ![окно](docs/img/frame.png)
 
 Слева — каталог сетевого диска и список надписей чертежа (клик выбирает, двойной клик правит),

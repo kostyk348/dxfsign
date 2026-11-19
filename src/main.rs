@@ -623,8 +623,10 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const USAGE: &str = "\
-dxfsign 0.1 - просмотр и правка DXF на сетевом диске с подписью каждого сохранения
+dxfsign — просмотр и правка DXF на сетевом диске; каждое сохранение подписано и отправлено письмом
 
 команды:
   inspect  <файл.dxf>
@@ -636,6 +638,7 @@ dxfsign 0.1 - просмотр и правка DXF на сетевом диск�
   catalog  [--config cfg.ini]\n  open     [<файл.dxf>] [--selftest <мс>]   -> окно просмотра и правки\n\nбез аргументов: открывается окно с демонстрационным чертежом";
 
 fn usage() -> ! {
+    eprintln!("dxfsign {}", VERSION);
     eprintln!("{}", USAGE);
     std::process::exit(2)
 }
@@ -669,6 +672,11 @@ fn main() {
         std::process::exit(run_default_mode());
     }
     match args[1].as_str() {
+        "--version" | "-V" | "version" => {
+            println!("dxfsign {}", VERSION);
+            return;
+        }
+        "--help" | "-h" | "help" => usage(),
         "inspect" => cmd_inspect(&args[1..]),
         "edit" => cmd_edit(&args[1..]),
         "save" => cmd_save(&args[1..]),
