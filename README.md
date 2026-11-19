@@ -37,14 +37,19 @@ dxfsign.exe --version
 * writes back `LINE`, `CIRCLE`, `LWPOLYLINE`, `TEXT`, `MTEXT` (blocks are expanded to geometry on
   save — a named limitation);
 * edits **label text** — the primary workflow: click, `F2`, type, `Enter`;
-* after the edit it **requires a wire number** — the change is not applied without it. The number is
-  stored in the drawing itself as XData (`1001 DXFSIGN`) and sent in the mail;
+* after a text edit it **requires a wire number** — the change is not applied without it. The number
+  is stored in the drawing as XData (`1001 DXFSIGN`) and sent in the mail;
+* a **comment without a text edit** (`--comment` / `F3`) needs **no wire number** — the remark goes to
+  the change list and the mail;
+* on the wire-number step, clicking the **TEXT** field returns to editing the text;
 * accepts a **free-form comment** that goes into the proposed-changes list, the `.txt` and the `.eml`;
 * save protocol: previous file → `_VERSIONS/<name>__<YYYYMMDD-HHMMSS>_<seq>.dxf`; working file
   replaced atomically; `.txt` next to it; `.eml` with three attachments (new `.dxf`, previous `.dxf`,
   `.txt`), HMAC-SHA256 over a canonical string, anchor row in `_VERSIONS/index.tsv`;
 * network-drive catalog in an INI file with an in-app **catalog editor** (`F4`, system folder picker),
   file open via `Ctrl+O` or drag-and-drop;
+* **spool folder** chosen in the window with `F5` (persisted to the INI) or `spool_dir` in the config;
+  default is `_SPOOL` **next to the drawing**;
 * **background loading**: the window appears at once, the overlay shows stage/percent/entity count and
   `Esc` cancels — a drawing with 820 000 entities is on screen in 0.3 s;
 * **Win32 window without a GUI framework**: toolbar, hover and selection highlight, wheel zoom
@@ -106,7 +111,9 @@ Panels = \\srv\\projects\\panels
 | Symptom | Cause and fix |
 |---|---|
 | `access denied (os error 5)` on save | The folder denies write access, or the file carries the read-only attribute. The program now names the exact cause; clear the attribute (`attrib -R file.dxf`) or save elsewhere — when access is denied the edit goes to `%LOCALAPPDATA%\dxfsign\outbox` instead of being lost. |
-| `file is in use by another program` | The drawing is open in AutoCAD or held by an antivirus — close it and retry. |
+| `file opened in another program (usually AutoCAD)` | The drawing is open in AutoCAD. While the file is locked **no version is created** — close the drawing and retry, then both version and mail appear. |
+| A timestamped version appeared but the drawing is unchanged | Behaviour of 1.0.4 and earlier; 1.0.5 checks the lock before rotating. |
+| The spool folder never appears | A relative `spool_dir` used to resolve against the launch directory. Now it resolves against the drawing folder; set your own with `F5` or `spool_dir` in the INI. |
 | Slow to open / appears frozen | Reading and parsing now run on a worker thread: the window shows up immediately with stage, percent and entity count, `Esc` cancels. Files over 1.5 GB or over 4 M expanded entities are reported instead of hanging. |
 | Nothing is drawn but the status shows entities | The file contains only unsupported types (`HATCH`, `DIMENSION`, `LEADER`, `XREF`) — counted in `report`, not drawn. |
 | Cyrillic text looks garbled | A legacy file was classified as UTF-8 or vice versa. `dxfsign.exe report file.dxf` prints `$ACADVER`. |

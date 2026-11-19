@@ -18,6 +18,8 @@
 //!     поэтому writer пишет поверх только после проверки, что файл содержит лишь
 //!     поддерживаемые сущности (см. `Unsupported` и решение в отчёте).
 
+use std::collections::HashMap;
+
 use crate::doc::{Circle, Doc, Poly, Seg, TextEnt, TEXT_KIND_MTEXT, TEXT_KIND_TEXT};
 use crate::pool::Handle;
 use crate::text::{cp1251_to_utf8, utf8_to_cp1251};
@@ -54,11 +56,13 @@ struct TagReader<'a> {
     data: &'a [u8],
     pos: usize,
     line: usize,
+    /// Сколько строк не разобрались как код группы (диагностика).
+    bad: usize,
 }
 
 impl<'a> TagReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, line: 0 }
+        Self { data, pos: 0, line: 0, bad: 0 }
     }
 
     /// Текущая позиция в файле — для прогресса загрузки.
@@ -85,11 +89,21 @@ impl<'a> TagReader<'a> {
     }
 
     /// Следующая пара (code, value). Стоимость O(1) на пару, буфер не копируется.
+    ///
+    /// Битая строка кода НЕ обрывает разбор: раньше первый же посторонний байт
+    /// завершал чтение молча — прогресс замирал на середине файла, а чертёж
+    /// приходил пустым. Теперь такая строка пропускается, а счётчик `bad` растёт.
     fn next_tag(&mut self) -> Option<(i32, &'a [u8])> {
-        let code_line = self.read_line()?;
-        let code = parse_code(code_line)?;
-        let value = self.read_line()?;
-        Some((code, value))
+        for _ in 0..8 {
+            let code_line = self.read_line()?;
+            let Some(code) = parse_code(code_line) else {
+                self.bad += 1;
+                continue;
+            };
+            let value = self.read_line()?;
+            return Some((code, value));
+        }
+        None
     }
 }
 
@@ -246,6 +260,10 @@ fn parse_hex_u32(s: &[u8]) -> u32 {
 pub struct ParseStats {
     pub total_entities: usize,
     pub skipped: usize,
+    /// Строки, не разобранные как код группы (обычно мусор в конце файла).
+    pub bad_lines: usize,
+    /// Вставок, не развёрнутых из-за потолка объектов.
+    pub truncated_inserts: usize,
     pub skipped_kinds: [u32; 8],
     /// Счётчики по типу сущности в ENTITIES/BLOCKS, включая неподдержанные.
     pub by_type: Vec<(String, usize)>,
@@ -313,6 +331,20 @@ const K_INSERT: u8 = 11;
 const K_SOLID: u8 = 12;
 const K_ARC: u8 = 13;
 const K_BLOCK: u8 = 14;
+
+/// Отложенная вставка блока. Собирается в главном проходе и разворачивается
+/// после него — второй полный проход по файлу больше не нужен (он читал файл
+/// заново и не обновлял прогресс: снаружи это выглядело как зависание).
+#[derive(Clone)]
+pub struct InsertRec {
+    pub name: Vec<u8>,
+    pub dx: f64,
+    pub dy: f64,
+    pub sx: f64,
+    pub sy: f64,
+    pub rot_deg: f64,
+    pub layer: u16,
+}
 
 /// Линейное преобразование блока при вставке: масштаб, поворот, сдвиг.
 #[derive(Clone, Copy)]
@@ -620,70 +652,7 @@ impl EntityBuf {
     }
 }
 
-/// Слои блока: сущность на слое «0» наследует слой вставки (правило AutoCAD).
-fn map_layer(src_doc: &Doc, src_layer: u16, dst: &mut Doc, insert_layer: u16) -> u16 {
-    let name = src_doc
-        .layers
-        .get(src_layer as usize)
-        .map(|l| src_doc.arena.get(l.name).to_vec())
-        .unwrap_or_else(|| b"0".to_vec());
-    if name == b"0" {
-        insert_layer
-    } else {
-        dst.layer_index(&name)
-    }
-}
 
-/// Скопировать содержимое блока в чертёж с преобразованием. O(N) по сущностям блока.
-fn copy_block(src: &Doc, dst: &mut Doc, xf: &Xform, insert_layer: u16) -> usize {
-    let base = dst.xs.len() as u32;
-    for i in 0..src.xs.len() {
-        let (x, y) = xf.apply(src.xs[i], src.ys[i]);
-        dst.push_point(x, y);
-    }
-    let mut n = 0usize;
-    for s in &src.segs {
-        let layer = map_layer(src, s.layer, dst, insert_layer);
-        dst.segs.push(Seg { a: base + s.a, b: base + s.b, layer });
-        n += 1;
-    }
-    for c in &src.circles {
-        let layer = map_layer(src, c.layer, dst, insert_layer);
-        dst.circles.push(Circle { c: base + c.c, r: c.r * xf.scale(), layer });
-        n += 1;
-    }
-    for p in &src.polys {
-        let first = dst.poly_verts.len() as u32;
-        for k in 0..p.len {
-            let pi = src.poly_verts[(p.first + k) as usize];
-            dst.poly_verts.push(base + pi);
-        }
-        let layer = map_layer(src, p.layer, dst, insert_layer);
-        dst.polys.push(Poly { first, len: p.len, closed: p.closed, layer });
-        n += 1;
-    }
-    for t in &src.texts {
-        let (x, y) = xf.apply(src.xs[t.pos as usize], src.ys[t.pos as usize]);
-        let pos = dst.push_point(x, y);
-        let layer = map_layer(src, t.layer, dst, insert_layer);
-        let (s, _) = dst.arena.push(src.arena.get(t.s));
-        let (w, _) = dst.arena.push(src.arena.get(t.wire));
-        let idx = dst.texts.len() as u32;
-        dst.texts.push(TextEnt {
-            pos,
-            height: t.height * xf.scale(),
-            rot_deg: t.rot_deg + xf.rot_deg(),
-            layer,
-            kind: t.kind,
-            s,
-            wire: w,
-            dxf_handle: t.dxf_handle,
-        });
-        dst.handles.push(crate::pool::Handle { slot: idx, gen: 1 });
-        n += 1;
-    }
-    n
-}
 
 impl Xform {
     fn rot_deg(&self) -> f64 {
@@ -700,38 +669,9 @@ fn find_block<'a>(blocks: &'a [(String, Doc)], name: &[u8]) -> Option<&'a Doc> {
         .map(|(_, d)| d)
 }
 
-/// Развернуть INSERT в геометрию. Глубина ограничена: циклические ссылки блоков
-/// в битых файлах не должны вешать разбор.
-fn expand_insert(
-    e: &EntityBuf,
-    blocks: &[(String, Doc)],
-    dst: &mut Doc,
-    stats: &mut ParseStats,
-    depth: usize,
-) {
-    if depth > 4 {
-        return;
-    }
-    let Some(src) = find_block(blocks, &e.block_name) else {
-        stats.inserts_unresolved += 1;
-        return;
-    };
-    let (dx, dy) = (e.coord[0].1, e.coord[1].1);
-    let rot = e.rot_deg.to_radians();
-    let xf = Xform {
-        sx: if e.scale_x == 0.0 { 1.0 } else { e.scale_x },
-        sy: if e.scale_y == 0.0 { 1.0 } else { e.scale_y },
-        cos: rot.cos(),
-        sin: rot.sin(),
-        dx,
-        dy,
-    };
-    stats.inserts_expanded += 1;
-    stats.inserted_entities += copy_block(src, dst, &xf, e.layer);
-}
 
 /// Завершить сущность и положить её в `doc`.
-fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
+fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats, recs: Option<&mut Vec<InsertRec>>) {
     stats.total_entities += 1;
     match e.kind {
         K_LINE => {
@@ -800,7 +740,22 @@ fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
             });
             doc.handles.push(crate::pool::Handle { slot: idx as u32, gen: 1 });
         }
-        K_NONE | K_BLOCK | K_VERTEX | K_SEQEND | K_POLYLINE | K_INSERT => {}
+        K_INSERT => {
+            // Слой вставки нужен сразу: элементы блока на слое «0» наследуют его.
+            let layer = doc.layer_index(&e.layer_name);
+            if let Some(recs) = recs {
+                recs.push(InsertRec {
+                    name: e.block_name.clone(),
+                    dx: e.coord[0].1,
+                    dy: e.coord[1].1,
+                    sx: if e.scale_x == 0.0 { 1.0 } else { e.scale_x },
+                    sy: if e.scale_y == 0.0 { 1.0 } else { e.scale_y },
+                    rot_deg: e.rot_deg,
+                    layer,
+                });
+            }
+        }
+        K_NONE | K_BLOCK | K_VERTEX | K_SEQEND | K_POLYLINE => {}
         K_UNKNOWN => {
             stats.skipped += 1;
         }
@@ -831,6 +786,7 @@ pub fn parse_with(
 ) -> Result<ParseStats> {
     doc.clear();
     let mut stats = ParseStats::default();
+    let mut recs: Vec<InsertRec> = Vec::new();
     if data.len() < 8 {
         return Err(DxfError::NotDxf);
     }
@@ -910,7 +866,13 @@ pub fn parse_with(
                             flush_poly(doc, &mut poly_pts, poly_layer, poly_closed);
                         }
                     }
-                    K_NONE | K_BLOCK | K_INSERT => {}
+                    // INSERT не рисуется напрямую, но должен попасть в
+                    // отложенный список вставок и в статистику.
+                    K_INSERT => {
+                        stats.bump(b"INSERT");
+                        finish_entity(&mut cur, doc, &mut stats, Some(&mut recs));
+                    }
+                    K_NONE | K_BLOCK => {}
                     _ => {
                         if cur.kind == K_UNKNOWN {
                             let n = cur.type_name.clone();
@@ -919,9 +881,9 @@ pub fn parse_with(
                             stats.bump(entity_kind_name(cur.kind));
                         }
                         if let Some((_, bdoc)) = cur_block.as_mut() {
-                            finish_entity(&mut cur, bdoc, &mut stats);
+                            finish_entity(&mut cur, bdoc, &mut stats, None);
                         } else {
-                            finish_entity(&mut cur, doc, &mut stats);
+                            finish_entity(&mut cur, doc, &mut stats, Some(&mut recs));
                         }
                     }
                 }
@@ -1060,15 +1022,14 @@ pub fn parse_with(
             K_NONE | K_POLYLINE => {}
             _ => {
                 stats.bump(entity_kind_name(cur.kind));
-                finish_entity(&mut cur, doc, &mut stats);
+                finish_entity(&mut cur, doc, &mut stats, Some(&mut recs));
             }
         }
     }
 
-    // INSERT разворачиваются ПОСЛЕ разбора: не важно, определён блок до или после
-    let pending: Vec<EntityBuf> = Vec::new();
-    let _ = pending;
-    expand_all_inserts(data, doc, &blocks, &mut stats);
+    // INSERT разворачиваются ПОСЛЕ разбора одним проходом: не важно, определён
+    // блок до или после вставки, и файл не читается второй раз.
+    expand_records(doc, &blocks, &recs, &mut stats, prog);
 
     if !saw_acadver && doc.dxf_version.is_empty() && stats.total_entities == 0 && doc.layers.is_empty() && doc.texts.is_empty() {
         return Err(DxfError::NotDxf);
@@ -1094,71 +1055,144 @@ fn entity_kind_name(kind: u8) -> &'static [u8] {
     }
 }
 
-/// Второй проход только по INSERT: так вставки разворачиваются независимо от
-/// порядка определений блоков в файле. O(N) по тегам ENTITIES.
-fn expand_all_inserts(data: &[u8], doc: &mut Doc, blocks: &[(String, Doc)], stats: &mut ParseStats) {
-    // Режим кодировки вычисляем из версии, а не берём по умолчанию: иначе имена
-    // блоков в UTF-8-файлах декодировались как CP1251 и вставки не находились.
-    let utf8_mode = doc.dxf_version.as_str() >= "AC1021";
-    // Ранний выход по `blocks.is_empty()` был ошибкой: тогда INSERT без определений
-    // вообще не попадал в статистику, и «пустой чертёж» оставался необъяснённым.
-    let mut r = TagReader::new(data);
-    let mut sec = Sec::None;
-    let mut cur = EntityBuf::default();
-    loop {
-        let (code, val) = match r.next_tag() {
-            Some(t) => t,
-            None => break,
+/// Скопировать содержимое блока в чертёж с преобразованием. O(N) по сущностям блока.
+///
+/// Карта слоёв строится один раз на блок (по числу слоёв), а не на каждую
+/// сущность: раньше на каждую сущность блока создавался `Vec` с именем слоя —
+/// на 40 000 вставок это миллионы аллокаций.
+fn copy_block(
+    src: &Doc,
+    dst: &mut Doc,
+    xf: &Xform,
+    insert_layer: u16,
+    budget: &mut u64,
+    stats: &mut ParseStats,
+) -> usize {
+    let total = (src.xs.len() + src.segs.len() + src.circles.len() + src.polys.len() + src.texts.len()) as u64;
+    if total > *budget {
+        // Потолок: лучше остановиться и сказать об этом, чем уйти в своп.
+        stats.truncated_inserts += 1;
+        return 0;
+    }
+    *budget -= total;
+    let mut lmap: Vec<u16> = Vec::with_capacity(src.layers.len());
+    for l in &src.layers {
+        let name = src.arena.get(l.name);
+        lmap.push(if name == b"0" { insert_layer } else { dst.layer_index(name) });
+    }
+    let layer_of = |i: u16| lmap.get(i as usize).copied().unwrap_or(insert_layer);
+    let base = dst.xs.len() as u32;
+    for i in 0..src.xs.len() {
+        let (x, y) = xf.apply(src.xs[i], src.ys[i]);
+        dst.push_point(x, y);
+    }
+    let mut n = 0usize;
+    for s in &src.segs {
+        dst.segs.push(Seg { a: base + s.a, b: base + s.b, layer: layer_of(s.layer) });
+        n += 1;
+    }
+    for c in &src.circles {
+        dst.circles.push(Circle { c: base + c.c, r: c.r * xf.scale(), layer: layer_of(c.layer) });
+        n += 1;
+    }
+    for p in &src.polys {
+        let first = dst.poly_verts.len() as u32;
+        for k in 0..p.len {
+            let pi = src.poly_verts[(p.first + k) as usize];
+            dst.poly_verts.push(base + pi);
+        }
+        dst.polys.push(Poly { first, len: p.len, closed: p.closed, layer: layer_of(p.layer) });
+        n += 1;
+    }
+    for t in &src.texts {
+        let (x, y) = xf.apply(src.xs[t.pos as usize], src.ys[t.pos as usize]);
+        let pos = dst.push_point(x, y);
+        let (s, _) = dst.arena.push(src.arena.get(t.s));
+        let (w, _) = dst.arena.push(src.arena.get(t.wire));
+        let idx = dst.texts.len() as u32;
+        dst.texts.push(TextEnt {
+            pos,
+            height: t.height * xf.scale(),
+            rot_deg: t.rot_deg,
+            layer: layer_of(t.layer),
+            s,
+            wire: w,
+            kind: t.kind,
+            dxf_handle: t.dxf_handle,
+        });
+        dst.handles.push(crate::pool::Handle { slot: idx, gen: 1 });
+        n += 1;
+    }
+    n
+}
+
+/// Развернуть собранные вставки после разбора — ОДНИМ проходом по списку.
+///
+/// Раньше здесь был второй полный проход по файлу: он читал чертёж заново, не
+/// обновлял прогресс (снаружи — «зависание на 53%») и на каждую вставку перебирал
+/// все определения блоков, создавая `String` (40 000 вставок × 2 000 блоков —
+/// 80 млн сравнений). Теперь индекс блоков — хеш-таблица, поиск O(1).
+fn expand_records(
+    doc: &mut Doc,
+    blocks: &[(String, Doc)],
+    recs: &[InsertRec],
+    stats: &mut ParseStats,
+    prog: Option<&crate::loader::Progress>,
+) {
+    if recs.is_empty() {
+        return;
+    }
+    if blocks.is_empty() {
+        stats.inserts_unresolved += recs.len();
+        return;
+    }
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::with_capacity(blocks.len() * 2);
+    for (i, (name, _)) in blocks.iter().enumerate() {
+        index.insert(lower_key(name.as_bytes()), i);
+    }
+    let mut budget = crate::loader::MAX_ENTITIES;
+    let mut key = Vec::with_capacity(64);
+    for (n, r) in recs.iter().enumerate() {
+        if let Some(p) = prog {
+            if n & 0x3FF == 0 {
+                p.done.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+                p.total.store(recs.len().max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+                p.entities.store(stats.inserted_entities as u64, std::sync::atomic::Ordering::Relaxed);
+                if p.cancelled() {
+                    return;
+                }
+            }
+        }
+        key.clear();
+        key.extend(r.name.iter().map(|c| c.to_ascii_lowercase()));
+        let Some(&bi) = index.get(&key) else {
+            stats.inserts_unresolved += 1;
+            continue;
         };
-        let val_t = trim(val);
-        if code == 0 {
-            let name = val_t;
-            // Сначала закрыть текущую INSERT (иначе последняя перед ENDSEC теряется —
-            // тот же класс ошибки, что и в основном проходе), потом служебные записи.
-            if matches!(sec, Sec::Entities) && cur.kind == K_INSERT {
-                stats.bump(b"INSERT");
-                expand_insert(&cur, blocks, doc, stats, 0);
-                cur.reset();
-            }
-            if name.eq_ignore_ascii_case(b"SECTION") {
-                sec = Sec::AwaitName;
-                cur.reset();
-                continue;
-            }
-            if name.eq_ignore_ascii_case(b"ENDSEC") {
-                sec = Sec::None;
-                cur.reset();
-                continue;
-            }
-            if name.eq_ignore_ascii_case(b"EOF") {
-                break;
-            }
-            if matches!(sec, Sec::Entities) {
-                cur.reset();
-                cur.utf8_mode = utf8_mode;
-                cur.set_kind(name);
-            }
+        if budget == 0 {
+            stats.truncated_inserts += 1;
             continue;
         }
-        match sec {
-            Sec::AwaitName => {
-                if code == 2 {
-                    sec = if val_t.eq_ignore_ascii_case(b"ENTITIES") { Sec::Entities } else { Sec::None };
-                }
-            }
-            Sec::Entities => {
-                if cur.kind != K_NONE {
-                    cur.push(code, val_t);
-                }
-            }
-            _ => {}
-        }
-    }
-    if matches!(sec, Sec::Entities) && cur.kind == K_INSERT {
-        stats.bump(b"INSERT");
-        expand_insert(&cur, blocks, doc, stats, 0);
+        let rot = r.rot_deg.to_radians();
+        let xf = Xform {
+            sx: r.sx,
+            sy: r.sy,
+            cos: rot.cos(),
+            sin: rot.sin(),
+            dx: r.dx,
+            dy: r.dy,
+        };
+        stats.inserts_expanded += 1;
+        stats.inserted_entities += copy_block(&blocks[bi].1, doc, &xf, r.layer, &mut budget, stats);
     }
 }
+
+/// Ключ для поиска блока: имена в DXF регистронезависимы, поэтому сравниваем
+/// приведёнными к нижнему регистру (временный буфер, без `String` на вставку).
+fn lower_key(s: &[u8]) -> Vec<u8> {
+    s.iter().map(|c| c.to_ascii_lowercase()).collect()
+}
+
 
 // ---------------------------------------------------------------- запись
 

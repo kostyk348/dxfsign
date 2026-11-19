@@ -77,6 +77,9 @@ pub trait Signer {
 /// eml-scada: письмо — это и есть запись, агент доставки забирает файл);
 /// `SmtpTransport` — отдельная реализация, в скелете НЕ реализована (см. отчёт).
 pub trait MailTransport {
+    /// Куда класть `.eml`. Вызывается перед отправкой: путь спула может зависеть от
+    /// расположения чертежа (по умолчанию `<папка чертежа>\_SPOOL`).
+    fn set_spool(&mut self, _dir: &str) {}
     /// Вернуть путь/идентификатор созданного письма.
     fn deliver(&mut self, raw: &[u8], suggested_name: &str) -> io::Result<String>;
 }
@@ -120,6 +123,19 @@ impl Default for LocalFs {
     }
 }
 
+/// Снять атрибут «только чтение»: без этого переименование поверх файла
+/// отвечает `ACCESS_DENIED` и на локальном диске, и на шаре.
+fn clear_readonly(path: &str) {
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.permissions().readonly() {
+            let mut perms = md.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
 impl FileSource for LocalFs {
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         std::fs::read(path)
@@ -129,15 +145,64 @@ impl FileSource for LocalFs {
         std::path::Path::new(path).exists()
     }
 
+    /// Запись «через временный файл» с повторами.
+    ///
+    /// Почему не один `rename`: на сетевых шарах и при живом антивирусе
+    /// переименование поверх существующего файла часто отвергается — сервер
+    /// отвечает `ACCESS_DENIED` (5) или `SHARING_VIOLATION` (32), и человек видит
+    /// «отказано в доступе» на папке, где у него полные права. Поэтому:
+    /// снимаем «только чтение», повторяем с нарастающей паузой, а если шара
+    /// переименование не поддерживает — пишем поверх файла напрямую и проверяем
+    /// результат чтением.
     fn write_atomic(&mut self, path: &str, data: &[u8]) -> io::Result<()> {
         let tmp = format!("{}.tmp{}", path, std::process::id());
         std::fs::write(&tmp, data)?;
-        // std::fs::rename на Windows заменяет целевой файл атомарно
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => Ok(()),
+        // сбрасываем буферы на диск: иначе на SMB переименование может обогнать данные
+        if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&tmp) {
+            let _ = f.sync_all();
+        }
+        let mut last: io::Error = io::Error::from_raw_os_error(5);
+        for attempt in 0..6u32 {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let code = e.raw_os_error().unwrap_or(0);
+                    last = e;
+                    if code != 5 && code != 32 && code != 183 {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(last);
+                    }
+                    clear_readonly(path);
+                    std::thread::sleep(std::time::Duration::from_millis(40 * (attempt as u64 + 1)));
+                }
+            }
+        }
+        // Шара не умеет переименовывать поверх: пишем на месте.
+        match std::fs::OpenOptions::new().write(true).truncate(true).open(path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                let _ = std::fs::remove_file(&tmp);
+                // Проверка: на SMB бывают укороченные записи.
+                match std::fs::read(path) {
+                    Ok(back) if back.len() == data.len() => Ok(()),
+                    Ok(_) => Err(io::Error::new(io::ErrorKind::Other, "запись на диск легла не полностью")),
+                    Err(e) => Err(e),
+                }
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
-                Err(e)
+                if e.raw_os_error() == Some(32) || e.raw_os_error() == Some(5) {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "файл занят другой программой (закройте его в AutoCAD) или защищён от записи",
+                    ))
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -229,6 +294,12 @@ impl SpoolTransport {
 }
 
 impl MailTransport for SpoolTransport {
+    fn set_spool(&mut self, dir: &str) {
+        if !dir.trim().is_empty() {
+            self.dir = dir.to_string();
+        }
+    }
+
     fn deliver(&mut self, raw: &[u8], suggested_name: &str) -> io::Result<String> {
         self.fs.create_dir_all(&self.dir)?;
         let path = format!("{}\\{}", self.dir.trim_end_matches(['\\', '/']), suggested_name);

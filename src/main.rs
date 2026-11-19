@@ -263,17 +263,40 @@ fn cmd_edit(args: &[String]) {
     let path = args.get(1).cloned().unwrap_or_else(|| die("edit: нужен путь к .dxf"));
     let (mut d, _) = load_doc(&path);
     let idx: usize = arg_val(args, "--idx").unwrap_or_else(|| die("edit: --idx N")).parse().unwrap_or_else(|_| die("--idx: число"));
-    let text = arg_val(args, "--text").unwrap_or_else(|| die("edit: --text \"...\""));
-    let wire = arg_val(args, "--wire").unwrap_or_else(|| die("edit: --wire W-1 (обязателен)"));
+    let text = arg_val(args, "--text");
+    let wire = arg_val(args, "--wire");
     let comment = arg_val(args, "--comment").unwrap_or_default();
+    // Только комментарий: текст не правится, номер провода не требуется.
+    let comment_only = text.is_none() && !comment.is_empty();
+    if text.is_none() && comment.is_empty() {
+        die("edit: нужен --text \"...\" или --comment \"...\"");
+    }
     let mut s = edit::EditSession::new();
-    s.begin(idx, &d.arena_get(d.texts[idx].s).to_vec());
-    s.text.set(text.as_bytes());
+    let cur = d.arena_get(d.texts[idx].s).to_vec();
+    if comment_only {
+        s.begin_comment(idx, &cur);
+    } else {
+        s.begin(idx, &cur);
+        s.text.set(text.as_deref().unwrap_or("").as_bytes());
+    }
     s.comment.set(comment.as_bytes());
-    s.commit_text();
-    s.wire.set(wire.as_bytes());
+    if !comment_only {
+        s.commit_text();
+    }
+    s.wire.set(wire.clone().unwrap_or_default().as_bytes());
     match s.submit_wire(&mut d) {
-        edit::Outcome::Applied => println!("правка применена: надпись [{}] -> \"{}\", провод {}", idx, text, wire),
+        edit::Outcome::Applied => {
+            if comment_only {
+                println!("добавлен комментарий к надписи [{}]: \"{}\"", idx, comment);
+            } else {
+                println!(
+                    "правка применена: надпись [{}] -> \"{}\", провод {}",
+                    idx,
+                    text.as_deref().unwrap_or(""),
+                    wire.as_deref().unwrap_or("—")
+                );
+            }
+        }
         edit::Outcome::Rejected => die(format!("номер провода не принят: {}", s.error.message()).as_str()),
         _ => die("правка не применена"),
     }

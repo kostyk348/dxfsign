@@ -94,6 +94,9 @@ pub struct EditSession {
     /// Последний принятый номер: подставляется как значение по умолчанию
     /// (в шлейфе провода номера идут серией, печатать заново — лишние движения).
     pub last_wire: EditBuffer,
+    /// Режим «только комментарий»: текст надписи не меняется, номер провода не
+    /// обязателен. Требование владельца: замечание можно оставить и без провода.
+    pub comment_only: bool,
     pub applied: u32,
     pub canceled: u32,
 }
@@ -107,6 +110,7 @@ impl EditSession {
             comment: EditBuffer::new(),
             error: WireError::None,
             last_wire: EditBuffer::new(),
+            comment_only: false,
             applied: 0,
             canceled: 0,
         }
@@ -119,12 +123,30 @@ impl EditSession {
 
     /// Шаг 1: начать правку надписи `idx` — поле ввода получает текущий текст.
     pub fn begin(&mut self, idx: usize, current: &[u8]) {
+        self.comment_only = false;
         self.text.set(current);
         self.wire.set(self.last_wire.as_bytes());
         self.wire.caret = self.wire.as_bytes().len();
         self.comment.set(b"");
         self.error = WireError::None;
         self.step = Step::Editing { idx };
+    }
+
+    /// Начать сценарий «просто комментарий»: текст надписи не правится, номер
+    /// провода не обязателен. Комментарий всё равно попадает в перечень изменений.
+    pub fn begin_comment(&mut self, idx: usize, current: &[u8]) {
+        self.begin(idx, current);
+        self.comment_only = true;
+        self.comment.set(b"");
+        self.error = WireError::None;
+    }
+
+    /// Вернуться к полю ТЕКСТ кликом мыши на любом шаге (раньше после перехода к
+    /// номеру провода поле текста уже не принимало правку).
+    pub fn back_to_text(&mut self) {
+        if let Step::AwaitWire { idx } = self.step {
+            self.step = Step::Editing { idx };
+        }
     }
 
     /// Шаг 2: текст подтверждён -> запрос номера провода. Документ не тронут.
@@ -144,6 +166,8 @@ impl EditSession {
     pub fn submit_wire(&mut self, doc: &mut Doc) -> Outcome {
         let idx = match self.step {
             Step::AwaitWire { idx } => idx,
+            // В режиме «только комментарий» шаг провода не наступает: применяем сразу.
+            Step::Editing { idx } if self.comment_only => idx,
             _ => return Outcome::Nothing,
         };
         self.validate();
@@ -153,7 +177,12 @@ impl EditSession {
         let q = self.text.as_bytes().to_vec();
         let w = self.wire.as_bytes().to_vec();
         let c = self.comment.as_bytes().to_vec();
-        doc.edit_text(idx, &q, &w, &c);
+        if self.comment_only {
+            // Только замечание: надпись не меняется, номер провода не нужен.
+            doc.add_comment(idx, &c, &w);
+        } else {
+            doc.edit_text(idx, &q, &w, &c);
+        }
         let _ = self.last_wire.insert_char(' '); // no-op, чтобы не забыть про поле
         self.last_wire.set(&w);
         self.step = Step::Idle;
@@ -173,7 +202,12 @@ impl EditSession {
     }
 
     fn validate(&mut self) {
-        self.error = validate_wire(self.wire.as_bytes());
+        // В режиме «только комментарий» номер провода не требуется.
+        self.error = if self.comment_only {
+            WireError::None
+        } else {
+            validate_wire(self.wire.as_bytes())
+        };
     }
 }
 
@@ -228,6 +262,32 @@ mod tests {
         assert_eq!(d.arena.get(d.texts[0].s), "Клемма 2".as_bytes());
         assert_eq!(d.arena.get(d.texts[0].wire), "W-101".as_bytes());
         assert_eq!(d.log.len(), 1);
+    }
+
+    #[test]
+    fn comment_needs_no_wire_and_does_not_touch_text() {
+        let mut d = doc();
+        let mut s = EditSession::new();
+        s.begin_comment(0, &d.arena.get(d.texts[0].s).to_vec());
+        assert!(s.comment_only);
+        s.comment.set("замечание ПТО".as_bytes());
+        // номер провода пуст — и это не ошибка в режиме комментария
+        assert_eq!(s.submit_wire(&mut d), Outcome::Applied);
+        assert_eq!(d.arena.get(d.texts[0].s), "Клемма 1".as_bytes());
+        assert_eq!(d.log.len(), 1);
+        assert_eq!(d.arena.get(d.log.entries[0].comment), "замечание ПТО".as_bytes());
+    }
+
+    #[test]
+    fn click_back_to_text_returns_to_editing() {
+        let mut d = doc();
+        let mut s = EditSession::new();
+        s.begin(0, b"x");
+        s.commit_text();
+        assert!(matches!(s.step, Step::AwaitWire { .. }));
+        s.back_to_text();
+        assert!(matches!(s.step, Step::Editing { .. }), "клик по ТЕКСТ обязан вернуть правку текста");
+        let _ = d;
     }
 
     #[test]

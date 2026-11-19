@@ -489,12 +489,12 @@ fn start_edit(comment_only: bool) {
         return;
     };
     let cur = c.doc.arena_get(c.doc.texts[idx].s).to_vec();
-    c.session.begin(idx, &cur);
     if comment_only {
-        c.session.text.set(&cur);
-        c.session.comment.set(b"");
-        set_flash("F3: комментарий. Tab — поле, Enter — принять, Esc — отмена");
+        // «Просто комментарий»: номер провода не обязателен.
+        c.session.begin_comment(idx, &cur);
+        set_flash("Комментарий: номер провода не нужен. Enter — принять, Esc — отмена");
     } else {
+        c.session.begin(idx, &cur);
         set_flash("F2: правка текста. Tab — поле, Enter — принять, Esc — отмена");
     }
     c.focus = if comment_only { 2 } else { 0 };
@@ -779,12 +779,24 @@ fn submit_modal() {
     let c = ctx();
     match c.session.step {
         crate::edit::Step::Editing { .. } => {
-            c.session.commit_text();
-            c.focus = 1;
-            if c.session.error != WireError::None {
-                set_flash(c.session.error.message());
+            if c.session.comment_only {
+                // Комментарий применяется сразу: номер провода не запрашивается.
+                let o = c.session.submit_wire(&mut c.doc);
+                match o {
+                    Outcome::Applied => {
+                        set_flash("Комментарий принят. Ctrl+S — сохранить с версией и письмом");
+                        c.focus = 0;
+                    }
+                    _ => set_flash(c.session.error.message()),
+                }
             } else {
-                set_flash("Введите номер провода (обязательно), Tab — комментарий");
+                c.session.commit_text();
+                c.focus = 1;
+                if c.session.error != WireError::None {
+                    set_flash(c.session.error.message());
+                } else {
+                    set_flash("Введите номер провода (обязательно), Tab — комментарий");
+                }
             }
         }
         crate::edit::Step::AwaitWire { .. } => {
@@ -1028,6 +1040,9 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     return 0;
                 }
                 if crate::render::hit(L.text, x, y) {
+                    // Свободный возврат: клик по ТЕКСТ с шага «номер провода»
+                    // продолжает правку текста, а не просто ставит курсор.
+                    c.session.back_to_text();
                     c.focus = 0;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
@@ -1305,6 +1320,30 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 }
+                VK_F5 => {
+                    // Куда складывать .eml. Выбранная папка пишется в ini, поэтому
+                    // «нельзя задать, где спул» больше не проблема.
+                    let start = if c.cfg.spool_dir.is_empty() {
+                        None
+                    } else {
+                        Some(c.cfg.spool_dir.clone())
+                    };
+                    if let Some(dir) = crate::dialogs::pick_folder(c.hwnd as isize, "Папка для .eml (спул)") {
+                        c.cfg.spool_dir = dir.clone();
+                        let saved = persist_cfg();
+                        let msg = if saved {
+                            format!("Спул: {} (записано в ini)", dir)
+                        } else {
+                            format!("Спул: {} (ini не сохранён: файл конфига недоступен)", dir)
+                        };
+                        c.ui.set_spool(&dir);
+                        set_flash(&msg);
+                    } else {
+                        set_flash("Выбор папки спула отменён");
+                        let _ = start;
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 VK_F7 => {
                     fit_view();
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -1385,7 +1424,11 @@ pub fn run(
 
         let mut ui = UiState::new();
         ui.set_file(title);
-        ui.set_spool(if cfg.spool_dir.is_empty() { "спул не задан" } else { &cfg.spool_dir });
+        ui.set_spool(if cfg.spool_dir.trim().is_empty() {
+            "\u{2192} _SPOOL рядом с чертежом (F5 — задать папку)"
+        } else {
+            &cfg.spool_dir
+        });
         ui.set_last("ещё не сохраняли");
         for e in &cfg.catalog {
             ui.catalog_names.push(e.name.clone());

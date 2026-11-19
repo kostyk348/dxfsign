@@ -163,6 +163,12 @@ fn file_stem(path: &str) -> String {
 
 /// Каталог файла (полный, а не последний сегмент): на нём строятся пути
 /// `_VERSIONS` и индекса цепочки. O(len).
+/// Абсолютный ли путь: `C:\\...`, `\\\\srv\\share\\...` или `/...`.
+pub fn is_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || p.starts_with("\\\\") || p.starts_with('/')
+}
+
 pub fn parent_dir(path: &str) -> String {
     match path.rfind(['\\', '/']) {
         Some(i) if i > 0 => path[..i].to_string(),
@@ -308,6 +314,38 @@ pub fn save_to(
     forced_target: Option<&str>,
 ) -> Result<SaveOutcome, SaveError> {
     let doc_path: String = forced_target.map(|s| s.to_string()).unwrap_or_else(|| doc.path.clone());
+
+    // ---- шаг 0: права, атрибут и ЗАНЯТОСТЬ файла.
+    // Раньше это проверялось уже после чтения прежней версии, поэтому занятый
+    // AutoCAD-ом файл давал голый «os error 32», а версия успевала создаться.
+    let dir0 = parent_dir(&doc_path);
+    if fs.exists(&dir0) {
+        crate::ports::probe_writable(fs, &dir0)
+            .map_err(|hint| SaveError::AccessDenied { path: dir0.clone(), hint })?;
+    } else {
+        return Err(SaveError::Io(format!("каталог чертежа не найден: {}", dir0)));
+    }
+    if let Ok(md) = std::fs::metadata(&doc_path) {
+        if md.permissions().readonly() {
+            return Err(SaveError::AccessDenied {
+                path: doc_path.clone(),
+                hint: "файл помечен «только чтение»: снимите атрибут или сохраните через «Сохранить как»".to_string(),
+            });
+        }
+    }
+    if fs.exists(&doc_path) {
+        // Проба записи: если чертёж открыт в AutoCAD, здесь и остановимся —
+        // до ротации версии, чтобы «версия с таймстампом» не появлялась зря.
+        if let Err(e) = std::fs::OpenOptions::new().write(true).open(&doc_path) {
+            return Err(match e.raw_os_error() {
+                Some(32) | Some(5) | Some(33) => SaveError::AccessDenied {
+                    path: doc_path.clone(),
+                    hint: "файл открыт в другой программе (обычно AutoCAD). Закройте чертёж в AutoCAD и повторите — тогда создадутся и версия, и письмо".to_string(),
+                },
+                _ => SaveError::Io(format!("файл недоступен для записи: {}", crate::ports::describe_io(&e))),
+            });
+        }
+    }
     // ---- шаг 1: новые байты и их хеш
     let _lost = crate::dxf::write(doc, dxf_bytes);
     let new_hash = sha256(dxf_bytes);
@@ -337,22 +375,6 @@ pub fn save_to(
 
     let dir = parent_dir(&doc_path);
     let vdir = join(&dir, &cfg.versions_dir);
-    // Права проверяем ДО первой записи: иначе человек получает «os error 5» уже
-    // после того, как часть протокола отработала.
-    if fs.exists(&dir) {
-        crate::ports::probe_writable(fs, &dir).map_err(|hint| SaveError::AccessDenied { path: dir.clone(), hint })?;
-    } else {
-        return Err(SaveError::Io(format!("каталог чертежа не найден: {}", dir)));
-    }
-    // файл может быть помечен «только чтение» — это тоже error 5
-    if let Ok(md) = std::fs::metadata(&doc_path) {
-        if md.permissions().readonly() {
-            return Err(SaveError::AccessDenied {
-                path: doc_path.clone(),
-                hint: "файл помечен «только чтение»: снимите атрибут или сохраните через «Сохранить как»".to_string(),
-            });
-        }
-    }
     if let Some(pb) = &prev {
         fs.create_dir_all(&vdir).map_err(|e| {
         if e.raw_os_error() == Some(5) {
@@ -406,7 +428,29 @@ pub fn save_to(
         .map_err(|e| SaveError::Io(e.to_string()))?;
     out.txt_path = txt_path;
 
-    // ---- шаг 4b: письмо
+    // ---- шаг 4b: письмо. Спул создаём здесь же: раньше папка появлялась только
+    // при удачном письме, и «SPOOL нет» было не отличить от «письмо не писалось».
+    // Относительный путь спула считается ОТ ПАПКИ ЧЕРТЕЖА, а не от текущего
+    // каталога процесса: у ярлыка это мог быть C:\Windows\System32, и запись
+    // падала с «отказано в доступе», а рядом с чертежом папки не появлялось.
+    let spool = {
+        let raw = cfg.spool_dir.trim();
+        if raw.is_empty() {
+            join(&dir, "_SPOOL")
+        } else if is_absolute(raw) {
+            raw.to_string()
+        } else {
+            join(&dir, raw)
+        }
+    };
+    if let Err(e) = fs.create_dir_all(&spool) {
+        return Err(SaveError::Io(format!(
+            "не удалось создать каталог спула «{}»: {}. Задайте spool_dir в конфиге (папка, куда класть .eml)",
+            spool,
+            crate::ports::describe_io(&e)
+        )));
+    }
+    let _ = mail.set_spool(&spool);
     let wires = collect_wires(&doc.log.entries, doc);
     out.wires = wires.clone();
     let comments = collect_comments(&doc.log.entries, doc);
