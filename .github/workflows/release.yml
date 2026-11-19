@@ -7,32 +7,41 @@ on:
 permissions:
   contents: write
 
+# ВАЖНО: обе сборки идут target x86_64-pc-windows-gnu.
+# MSVC-сборка на windows-latest тянет api-ms-win-core-synch-l1-2-0.dll (API уровня Win10)
+# и vcruntime — это ломает и Win7, и обещание «один файл без redist». Проверено objdump-ом:
+# gnu-сборка импортирует только KERNEL32/USER32/GDI32/comdlg32/SHELL32/ole32/ntdll + UCRT.
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: "-C strip=symbols"
     steps:
       - uses: actions/checkout@v4
 
-      # --- сборка для Windows 10/11 (stable, MSVC)
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Test
-        run: cargo test --offline
-      - name: Build win64
-        run: cargo build --release --offline
-      - name: Stage win64
-        shell: pwsh
-        run: |
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          Copy-Item target/release/dxfsign.exe "dxfsign-$v-win64.exe"
-          ./target/release/dxfsign.exe --version
-
-      # --- сборка для Windows 7 (rustc 1.77.2 + MinGW)
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc
           path-type: inherit
-      - name: Add rustc 1.77.2 with gnu target
+
+      # --- Windows 10/11: stable, тот же gnu-таргет, что проверен локально
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Test (stable)
+        run: cargo test --offline
+      - name: Build win64
+        run: cargo build --release --offline --target x86_64-pc-windows-gnu
+      - name: Stage win64
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Copy-Item target/x86_64-pc-windows-gnu/release/dxfsign.exe "dxfsign-$v-win64.exe"
+          ./target/x86_64-pc-windows-gnu/release/dxfsign.exe --version
+
+      # --- Windows 7: пин 1.77.2 (последний rustc со std под Win7)
+      - name: Add rustc 1.77.2 + gnu target
         run: |
           rustup toolchain install 1.77.2 --profile minimal
           rustup target add x86_64-pc-windows-gnu --toolchain 1.77.2
@@ -44,6 +53,17 @@ jobs:
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
           Copy-Item target/x86_64-pc-windows-gnu/release/dxfsign.exe "dxfsign-$v-win7-x64.exe"
 
+      - name: Guard: no Win10-only imports
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem dxfsign-*.exe | ForEach-Object {
+            $dlls = (objdump -p $_.FullName | Select-String 'DLL Name' | ForEach-Object { ($_ -split ':',2)[1].Trim() })
+            Write-Host "$($_.Name): $($dlls -join ', ')"
+            if ($dlls -match 'api-ms-win-core|vcruntime|msvcp|msvcr') { $bad = 1 }
+          }
+          if ($bad -ne 0) { throw "Win10-only / redist imports detected" }
+
       - name: Checksums
         shell: pwsh
         run: |
@@ -53,16 +73,24 @@ jobs:
           } | Set-Content -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
 
-      - name: Publish assets to the release
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxfsign-exe
+          path: |
+            dxfsign-*.exe
+            SHA256SUMS.txt
+
+      - name: Publish to release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
-          if ($tag -notlike "v*") { $tag = "v" + (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value }
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "dxfsign $tag" --generate-notes
+          if ($tag -notlike "v*") {
+            $tag = "v" + (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
           }
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --title "dxfsign $tag" --generate-notes }
           gh release upload $tag dxfsign-*.exe SHA256SUMS.txt --clobber
           gh release view $tag --json assets --jq '.assets[] | "\(.name) \(.size) \(.state)"'
