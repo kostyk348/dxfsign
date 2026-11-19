@@ -1,7 +1,8 @@
 name: release
+# Запуск ТОЛЬКО вручную: публикация релиза — из проверенных локальных сборок
+# (обратная сверка ассетов обязательна). Пуш тега больше не перезаписывает релиз:
+# один раз CI уже заменил проверенные файлы сборкой msvc с api-ms-win-core-synch-l1-2-0.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -53,16 +54,19 @@ jobs:
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
           Copy-Item target/x86_64-pc-windows-gnu/release/dxfsign.exe "dxfsign-$v-win7-x64.exe"
 
-      - name: Guard: no Win10-only imports
+      - name: Guard: imports
         shell: pwsh
         run: |
           $bad = 0
           Get-ChildItem dxfsign-*.exe | ForEach-Object {
             $dlls = (objdump -p $_.FullName | Select-String 'DLL Name' | ForEach-Object { ($_ -split ':',2)[1].Trim() })
             Write-Host "$($_.Name): $($dlls -join ', ')"
-            if ($dlls -match 'api-ms-win-core|vcruntime|msvcp|msvcr') { $bad = 1 }
+            # vcruntime/msvcp/msvcr = внешний redist, недопустимо в обеих сборках
+            if ($dlls -match 'vcruntime|msvcp|msvcr') { $bad = 1 }
+            # api-ms-win-core-* = Win10-only: допустимо ТОЛЬКО у win64 (stable), у win7 — нет
+            if ($_.Name -like '*win7*' -and $dlls -match 'api-ms-win-core') { $bad = 1 }
           }
-          if ($bad -ne 0) { throw "Win10-only / redist imports detected" }
+          if ($bad -ne 0) { throw "bad imports" }
 
       - name: Checksums
         shell: pwsh
@@ -81,7 +85,7 @@ jobs:
             dxfsign-*.exe
             SHA256SUMS.txt
 
-      - name: Publish to release
+      - name: Publish to release (manual run only)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

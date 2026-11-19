@@ -222,11 +222,46 @@ fn parse_hex_u32(s: &[u8]) -> u32 {
 
 /// Счётчик неподдержанных сущностей: нужен, чтобы не перезаписать файл,
 /// потеряв данные, о которых мы не знаем.
+/// Статистика разбора. `by_type` и `sections` — не украшение: это единственный
+/// способ понять, почему реальный файл из AutoCAD показался пустым (геометрия в
+/// `BLOCKS`, `INSERT`, `SPLINE`, `HATCH`, `DIMENSION`).
 #[derive(Debug, Default, Clone)]
 pub struct ParseStats {
     pub total_entities: usize,
     pub skipped: usize,
     pub skipped_kinds: [u32; 8],
+    /// Счётчики по типу сущности в ENTITIES/BLOCKS, включая неподдержанные.
+    pub by_type: Vec<(String, usize)>,
+    /// Имена секций, встреченных в файле.
+    pub sections: Vec<String>,
+    pub blocks: usize,
+    pub inserts_expanded: usize,
+    pub inserted_entities: usize,
+    /// INSERT без определения блока (битый файл или внешняя ссылка) — видно, а не молча.
+    pub inserts_unresolved: usize,
+}
+
+impl ParseStats {
+    pub fn bump(&mut self, kind: &[u8]) {
+        let name = String::from_utf8_lossy(kind).to_string();
+        if let Some(e) = self.by_type.iter_mut().find(|(k, _)| *k == name) {
+            e.1 += 1;
+        } else {
+            self.by_type.push((name, 1));
+        }
+    }
+    pub fn summary(&self) -> String {
+        let mut v: Vec<&(String, usize)> = self.by_type.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut s = String::new();
+        for (k, n) in v.iter().take(12) {
+            if !s.is_empty() {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("{}={}", k, n));
+        }
+        s
+    }
 }
 
 /// Разобрать ASCII DXF в `doc`. `doc` переиспользуется (capacity сохраняется),
@@ -237,17 +272,489 @@ enum Sec {
     AwaitName,
     Header,
     Tables,
+    Blocks,
     Entities,
 }
 
-/// Разобрать ASCII DXF в `doc` одним проходом. `doc` переиспользуется
-/// (capacity сохраняется), поэтому повторное открытие файла того же размера
-/// не аллоцирует на типовых чертежах.
+// Типы сущностей, которые разбор различает. Неподдержанные считаются и попадают
+// в статистику: иначе «файл пустой» невозможно объяснить.
+const K_NONE: u8 = 0;
+const K_LINE: u8 = 1;
+const K_CIRCLE: u8 = 2;
+const K_LWPOLY: u8 = 3;
+const K_TEXT: u8 = 4;
+const K_MTEXT: u8 = 5;
+const K_UNKNOWN: u8 = 6;
+const K_POLYLINE: u8 = 7;
+const K_VERTEX: u8 = 8;
+const K_SEQEND: u8 = 9;
+const K_SPLINE: u8 = 10;
+const K_INSERT: u8 = 11;
+const K_SOLID: u8 = 12;
+const K_ARC: u8 = 13;
+const K_BLOCK: u8 = 14;
+
+/// Линейное преобразование блока при вставке: масштаб, поворот, сдвиг.
+#[derive(Clone, Copy)]
+struct Xform {
+    sx: f64,
+    sy: f64,
+    cos: f64,
+    sin: f64,
+    dx: f64,
+    dy: f64,
+}
+
+impl Xform {
+    fn identity() -> Self {
+        Self { sx: 1.0, sy: 1.0, cos: 1.0, sin: 0.0, dx: 0.0, dy: 0.0 }
+    }
+    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        let (x, y) = (x * self.sx, y * self.sy);
+        (x * self.cos - y * self.sin + self.dx, x * self.sin + y * self.cos + self.dy)
+    }
+    fn scale(&self) -> f64 {
+        (self.sx.abs() + self.sy.abs()) * 0.5
+    }
+}
+
+/// Чистка текста DXF: `%%d` `%%c` `%%p` `%%%` и коды MTEXT (`\P`, `\~`, `\f…;`,
+/// `\H…;`, `\A…;`, `\C…;`, `\U+XXXX`). Без этого в чертеже видно `\P` и `%%c`.
+fn clean_text(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        // %% — обозначения AutoCAD
+        if src[i] == b'%' && i + 2 < src.len() && src[i + 1] == b'%' {
+            match src[i + 2] {
+                b'd' | b'D' => {
+                    out.extend_from_slice("°".as_bytes());
+                    i += 3;
+                    continue;
+                }
+                b'c' | b'C' => {
+                    out.extend_from_slice("Ø".as_bytes());
+                    i += 3;
+                    continue;
+                }
+                b'p' | b'P' => {
+                    out.extend_from_slice("±".as_bytes());
+                    i += 3;
+                    continue;
+                }
+                b'%' => {
+                    out.push(b'%');
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        // \U+XXXX — юникод-эскейп
+        if src[i] == b'\\' && i + 7 < src.len() && (src[i + 1] == b'U' || src[i + 1] == b'u') && src[i + 2] == b'+' {
+            if let Ok(hex) = std::str::from_utf8(&src[i + 3..i + 7]) {
+                if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                    if let Some(ch) = char::from_u32(cp) {
+                        let mut b = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+                        i += 7;
+                        continue;
+                    }
+                }
+            }
+        }
+        if src[i] == b'\\' && i + 1 < src.len() {
+            let c = src[i + 1];
+            match c {
+                b'P' => {
+                    out.push(b' ');
+                    i += 2;
+                    continue;
+                }
+                b'~' => {
+                    out.push(b' ');
+                    i += 2;
+                    continue;
+                }
+                b'\\' | b'{' | b'}' => {
+                    out.push(c);
+                    i += 2;
+                    continue;
+                }
+                b'f' | b'F' | b'H' | b'A' | b'C' | b'S' | b'T' | b'W' | b'Q' | b'p' => {
+                    // коды со значением до ';' — выбрасываем целиком
+                    let mut j = i + 2;
+                    while j < src.len() && src[j] != b';' {
+                        j += 1;
+                    }
+                    i = (j + 1).min(src.len());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(src[i]);
+        i += 1;
+    }
+    out
+}
+
+#[derive(Default)]
+struct EntityBuf {
+    kind: u8,
+    layer: u16,
+    coord: [(bool, f64); 6],
+    radius: f64,
+    height: f64,
+    rot_deg: f64,
+    flags: i32,
+    count: i32,
+    handle: u32,
+    s1: Vec<u8>,
+    s3: Vec<u8>,
+    app: Vec<u8>,
+    wire: Vec<u8>,
+    want_wire: bool,
+    verts: Vec<(f64, f64)>,
+    pending_x: Option<f64>,
+    /// INSERT: имя блока, масштабы, точка вставки
+    block_name: Vec<u8>,
+    scale_x: f64,
+    scale_y: f64,
+    /// Исходное имя типа для неподдержанных сущностей (HATCH, DIMENSION, …) —
+    /// чтобы статистика называла их своими именами, а не «UNKNOWN».
+    type_name: Vec<u8>,
+}
+
+impl EntityBuf {
+    fn reset(&mut self) {
+        self.kind = K_NONE;
+        self.layer = 0;
+        self.coord = [(false, 0.0); 6];
+        self.radius = 0.0;
+        self.height = 0.0;
+        self.rot_deg = 0.0;
+        self.flags = 0;
+        self.count = 0;
+        self.handle = 0;
+        self.s1.clear();
+        self.s3.clear();
+        self.app.clear();
+        self.wire.clear();
+        self.want_wire = false;
+        self.verts.clear();
+        self.pending_x = None;
+        self.block_name.clear();
+        self.scale_x = 1.0;
+        self.scale_y = 1.0;
+        self.type_name.clear();
+    }
+
+    fn set_kind(&mut self, name: &[u8]) {
+        self.type_name.clear();
+        self.type_name.extend_from_slice(name);
+        self.kind = if name.eq_ignore_ascii_case(b"BLOCK") {
+            K_BLOCK
+        } else if name.eq_ignore_ascii_case(b"LINE") {
+            K_LINE
+        } else if name.eq_ignore_ascii_case(b"CIRCLE") {
+            K_CIRCLE
+        } else if name.eq_ignore_ascii_case(b"ARC") {
+            K_ARC
+        } else if name.eq_ignore_ascii_case(b"LWPOLYLINE") {
+            K_LWPOLY
+        } else if name.eq_ignore_ascii_case(b"TEXT") || name.eq_ignore_ascii_case(b"ATTRIB") {
+            K_TEXT
+        } else if name.eq_ignore_ascii_case(b"MTEXT") {
+            K_MTEXT
+        } else if name.eq_ignore_ascii_case(b"POLYLINE") {
+            K_POLYLINE
+        } else if name.eq_ignore_ascii_case(b"VERTEX") {
+            K_VERTEX
+        } else if name.eq_ignore_ascii_case(b"SEQEND") {
+            K_SEQEND
+        } else if name.eq_ignore_ascii_case(b"SPLINE") {
+            K_SPLINE
+        } else if name.eq_ignore_ascii_case(b"INSERT") {
+            K_INSERT
+        } else if name.eq_ignore_ascii_case(b"SOLID") || name.eq_ignore_ascii_case(b"TRACE") || name.eq_ignore_ascii_case(b"3DFACE") {
+            K_SOLID
+        } else {
+            K_UNKNOWN
+        };
+    }
+
+    fn push(&mut self, code: i32, val: &[u8]) {
+        match code {
+            8 => {
+                let mut b = Vec::new();
+                cp1251_to_utf8(trim(val), &mut b);
+                self.s3 = b;
+            }
+            2 if self.kind == K_INSERT => {
+                let mut b = Vec::new();
+                cp1251_to_utf8(trim(val), &mut b);
+                self.block_name = b;
+            }
+            5 => self.handle = parse_hex_u32(val),
+            1 => {
+                self.s1.clear();
+                cp1251_to_utf8(trim(val), &mut self.s1);
+            }
+            3 => {
+                let mut b = Vec::new();
+                cp1251_to_utf8(trim(val), &mut b);
+                self.s3.extend_from_slice(&b);
+            }
+            10 => self.set_coord(0, parse_f64(val)),
+            20 => self.set_coord(1, parse_f64(val)),
+            30 => self.set_coord(2, parse_f64(val)),
+            11 => self.set_coord(3, parse_f64(val)),
+            21 => self.set_coord(4, parse_f64(val)),
+            31 => self.set_coord(5, parse_f64(val)),
+            12 => self.set_coord(3, parse_f64(val)),
+            22 => self.set_coord(4, parse_f64(val)),
+            13 => self.set_coord(5, parse_f64(val)),
+            40 => self.height = parse_f64(val),
+            50 => self.rot_deg = parse_f64(val),
+            // Масштабы вставки: 41 = X, 42 = Y, 43 = Z (а не 41/43, как можно
+            // решить по «похожести»). 42 у LWPOLYLINE — bulge, у TEXT — width factor,
+            // поэтому трактуем его как масштаб только у INSERT.
+            41 if self.kind == K_INSERT => self.scale_x = parse_f64(val),
+            42 if self.kind == K_INSERT => self.scale_y = parse_f64(val),
+            70 => self.flags = parse_i32(val),
+            90 => self.count = parse_i32(val),
+            1001 => {
+                self.app.clear();
+                self.app.extend_from_slice(trim(val));
+                self.want_wire = false;
+            }
+            1000 => {
+                let mut b = Vec::new();
+                cp1251_to_utf8(trim(val), &mut b);
+                if self.app == b"DXFSIGN" {
+                    if b == b"WIRE" {
+                        self.want_wire = true;
+                        self.wire.clear();
+                    } else if self.want_wire {
+                        self.wire.extend_from_slice(&b);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_coord(&mut self, i: usize, v: f64) {
+        // вершины и точки сплайна идут парами 10/20 (и 10/20/30 для 3D)
+        if matches!(self.kind, K_LWPOLY | K_SPLINE | K_SOLID) {
+            if i == 0 {
+                self.pending_x = Some(v);
+            } else if i == 1 {
+                if let Some(x) = self.pending_x.take() {
+                    self.verts.push((x, v));
+                }
+            }
+            return;
+        }
+        self.coord[i] = (true, v);
+    }
+}
+
+/// Слои блока: сущность на слое «0» наследует слой вставки (правило AutoCAD).
+fn map_layer(src_doc: &Doc, src_layer: u16, dst: &mut Doc, insert_layer: u16) -> u16 {
+    let name = src_doc
+        .layers
+        .get(src_layer as usize)
+        .map(|l| src_doc.arena.get(l.name).to_vec())
+        .unwrap_or_else(|| b"0".to_vec());
+    if name == b"0" {
+        insert_layer
+    } else {
+        dst.layer_index(&name)
+    }
+}
+
+/// Скопировать содержимое блока в чертёж с преобразованием. O(N) по сущностям блока.
+fn copy_block(src: &Doc, dst: &mut Doc, xf: &Xform, insert_layer: u16) -> usize {
+    let base = dst.xs.len() as u32;
+    for i in 0..src.xs.len() {
+        let (x, y) = xf.apply(src.xs[i], src.ys[i]);
+        dst.push_point(x, y);
+    }
+    let mut n = 0usize;
+    for s in &src.segs {
+        let layer = map_layer(src, s.layer, dst, insert_layer);
+        dst.segs.push(Seg { a: base + s.a, b: base + s.b, layer });
+        n += 1;
+    }
+    for c in &src.circles {
+        let layer = map_layer(src, c.layer, dst, insert_layer);
+        dst.circles.push(Circle { c: base + c.c, r: c.r * xf.scale(), layer });
+        n += 1;
+    }
+    for p in &src.polys {
+        let first = dst.poly_verts.len() as u32;
+        for k in 0..p.len {
+            let pi = src.poly_verts[(p.first + k) as usize];
+            dst.poly_verts.push(base + pi);
+        }
+        let layer = map_layer(src, p.layer, dst, insert_layer);
+        dst.polys.push(Poly { first, len: p.len, closed: p.closed, layer });
+        n += 1;
+    }
+    for t in &src.texts {
+        let (x, y) = xf.apply(src.xs[t.pos as usize], src.ys[t.pos as usize]);
+        let pos = dst.push_point(x, y);
+        let layer = map_layer(src, t.layer, dst, insert_layer);
+        let (s, _) = dst.arena.push(src.arena.get(t.s));
+        let (w, _) = dst.arena.push(src.arena.get(t.wire));
+        let idx = dst.texts.len() as u32;
+        dst.texts.push(TextEnt {
+            pos,
+            height: t.height * xf.scale(),
+            rot_deg: t.rot_deg + xf.rot_deg(),
+            layer,
+            kind: t.kind,
+            s,
+            wire: w,
+            dxf_handle: t.dxf_handle,
+        });
+        dst.handles.push(crate::pool::Handle { slot: idx, gen: 1 });
+        n += 1;
+    }
+    n
+}
+
+impl Xform {
+    fn rot_deg(&self) -> f64 {
+        self.sin.atan2(self.cos).to_degrees()
+    }
+}
+
+/// Найти определение блока по имени (без учёта регистра, как в AutoCAD).
+fn find_block<'a>(blocks: &'a [(String, Doc)], name: &[u8]) -> Option<&'a Doc> {
+    let n = String::from_utf8_lossy(name).to_string();
+    blocks
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(&n))
+        .map(|(_, d)| d)
+}
+
+/// Развернуть INSERT в геометрию. Глубина ограничена: циклические ссылки блоков
+/// в битых файлах не должны вешать разбор.
+fn expand_insert(
+    e: &EntityBuf,
+    blocks: &[(String, Doc)],
+    dst: &mut Doc,
+    stats: &mut ParseStats,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Some(src) = find_block(blocks, &e.block_name) else {
+        stats.inserts_unresolved += 1;
+        return;
+    };
+    let (dx, dy) = (e.coord[0].1, e.coord[1].1);
+    let rot = e.rot_deg.to_radians();
+    let xf = Xform {
+        sx: if e.scale_x == 0.0 { 1.0 } else { e.scale_x },
+        sy: if e.scale_y == 0.0 { 1.0 } else { e.scale_y },
+        cos: rot.cos(),
+        sin: rot.sin(),
+        dx,
+        dy,
+    };
+    stats.inserts_expanded += 1;
+    stats.inserted_entities += copy_block(src, dst, &xf, e.layer);
+}
+
+/// Завершить сущность и положить её в `doc`.
+fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
+    stats.total_entities += 1;
+    match e.kind {
+        K_LINE => {
+            let a = doc.push_point(e.coord[0].1, e.coord[1].1);
+            let b = doc.push_point(e.coord[3].1, e.coord[4].1);
+            let layer = doc.layer_index(&e.s3);
+            doc.segs.push(Seg { a, b, layer });
+        }
+        K_CIRCLE => {
+            let c = doc.push_point(e.coord[0].1, e.coord[1].1);
+            let layer = doc.layer_index(&e.s3);
+            doc.circles.push(Circle { c, r: e.height.abs(), layer });
+        }
+        K_ARC => {
+            // дуга показывается как окружность целиком: честное упрощение скелета,
+            // в отчёте помечено; важно, что она ВИДНА, а не пропущена
+            let c = doc.push_point(e.coord[0].1, e.coord[1].1);
+            let layer = doc.layer_index(&e.s3);
+            doc.circles.push(Circle { c, r: e.height.abs(), layer });
+        }
+        K_LWPOLY | K_SPLINE => {
+            if e.verts.len() >= 2 {
+                let first = doc.poly_verts.len() as u32;
+                for &(x, y) in &e.verts {
+                    let i = doc.push_point(x, y);
+                    doc.poly_verts.push(i);
+                }
+                let layer = doc.layer_index(&e.s3);
+                doc.polys.push(Poly {
+                    first,
+                    len: e.verts.len() as u32,
+                    closed: (e.flags & 1) != 0 || e.kind == K_SPLINE && (e.flags & 1) != 0,
+                    layer,
+                });
+            }
+        }
+        K_SOLID => {
+            if e.verts.len() >= 3 {
+                let first = doc.poly_verts.len() as u32;
+                for &(x, y) in &e.verts {
+                    let i = doc.push_point(x, y);
+                    doc.poly_verts.push(i);
+                }
+                let layer = doc.layer_index(&e.s3);
+                doc.polys.push(Poly { first, len: e.verts.len() as u32, closed: true, layer });
+            }
+        }
+        K_TEXT | K_MTEXT => {
+            let pos = doc.push_point(e.coord[0].1, e.coord[1].1);
+            let layer = doc.layer_index(&e.s3);
+            let cleaned = clean_text(&e.s1);
+            let (s, _) = doc.arena.push(&cleaned);
+            let (wr, _) = doc.arena.push(&e.wire);
+            let idx = doc.texts.len();
+            doc.texts.push(TextEnt {
+                pos,
+                height: if e.height.abs() < 1e-9 { 2.5 } else { e.height.abs() },
+                rot_deg: e.rot_deg,
+                layer,
+                kind: if e.kind == K_MTEXT { TEXT_KIND_MTEXT } else { TEXT_KIND_TEXT },
+                s,
+                wire: wr,
+                dxf_handle: e.handle,
+            });
+            doc.handles.push(crate::pool::Handle { slot: idx as u32, gen: 1 });
+        }
+        K_NONE | K_BLOCK | K_VERTEX | K_SEQEND | K_POLYLINE | K_INSERT => {}
+        K_UNKNOWN => {
+            stats.skipped += 1;
+        }
+        _ => {}
+    }
+}
+
+/// Разобрать ASCII DXF в `doc` одним проходом.
 ///
-/// Почему один проход, а не вложенные читатели: первая версия звала
-/// `read_header`/`read_tables`, и они съедали пару `0 SECTION / 2 ENTITIES`,
-/// после чего геометрия молча не читалась. Состояние секции теперь одно и
-/// живёт в самом цикле — такую ошибку больше негде спрятать.
+/// Поддержано: `LINE`, `CIRCLE`, `ARC` (как окружность), `LWPOLYLINE`,
+/// `POLYLINE`+`VERTEX` (старый формат R12), `SPLINE` (по контрольным точкам),
+/// `TEXT`/`ATTRIB`, `MTEXT` (с чисткой кодов), `SOLID`/`TRACE`/`3DFACE`,
+/// **`BLOCKS` + `INSERT`** с масштабом, поворотом и наследованием слоя.
+/// Не поддержано (считается в статистике): `HATCH`, `DIMENSION`, `LEADER`,
+/// `MLINE`, `XREF`. Они не теряются молча — попадают в `by_type`.
 pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
     doc.clear();
     let mut stats = ParseStats::default();
@@ -263,6 +770,24 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
     let mut pending_layer: Option<Vec<u8>> = None;
     let mut scratch: Vec<u8> = Vec::with_capacity(256);
     let mut saw_acadver = false;
+    let mut blocks: Vec<(String, Doc)> = Vec::new();
+    let mut cur_block: Option<(String, Doc)> = None;
+    // состояние старой полилинии (POLYLINE ... VERTEX ... SEQEND)
+    let mut poly_pts: Vec<(f64, f64)> = Vec::new();
+    let mut poly_layer: u16 = 0;
+    let mut poly_closed = false;
+
+    fn flush_poly(doc: &mut Doc, pts: &mut Vec<(f64, f64)>, layer: u16, closed: bool) {
+        if pts.len() >= 2 {
+            let first = doc.poly_verts.len() as u32;
+            for &(x, y) in pts.iter() {
+                let i = doc.push_point(x, y);
+                doc.poly_verts.push(i);
+            }
+            doc.polys.push(Poly { first, len: pts.len() as u32, closed, layer });
+        }
+        pts.clear();
+    }
 
     loop {
         let (code, val) = match r.next_tag() {
@@ -272,55 +797,97 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
         let val_t = trim(val);
         if code == 0 {
             let name = val_t;
-            if name.eq_ignore_ascii_case(b"SECTION") {
-                if sec == Sec::Entities && cur.kind != K_NONE {
-                    finish_entity(&mut cur, doc, &mut stats);
-                    cur.reset();
+            // ВАЖНО: сначала дописать предыдущую сущность, потом разбирать служебные
+            // записи. Иначе последняя сущность перед ENDSEC/BLOCK теряется — эта
+            // ошибка уже стоила «пустого» TEXT в тестах.
+            let in_scope = matches!(sec, Sec::Entities)
+                || (matches!(sec, Sec::Blocks) && cur_block.is_some());
+            if in_scope {
+                match cur.kind {
+                    K_POLYLINE => {
+                        poly_pts.clear();
+                        poly_closed = (cur.flags & 1) != 0;
+                        let name_bytes = cur.s3.clone();
+                        poly_layer = if let Some((_, bdoc)) = cur_block.as_mut() {
+                            bdoc.layer_index(&name_bytes)
+                        } else {
+                            doc.layer_index(&name_bytes)
+                        };
+                        stats.bump(b"POLYLINE");
+                    }
+                    K_VERTEX => poly_pts.push((cur.coord[0].1, cur.coord[1].1)),
+                    K_SEQEND => {
+                        if let Some((_, bdoc)) = cur_block.as_mut() {
+                            flush_poly(bdoc, &mut poly_pts, poly_layer, poly_closed);
+                        } else {
+                            flush_poly(doc, &mut poly_pts, poly_layer, poly_closed);
+                        }
+                    }
+                    K_NONE | K_BLOCK | K_INSERT => {}
+                    _ => {
+                        if cur.kind == K_UNKNOWN {
+                            let n = cur.type_name.clone();
+                            stats.bump(&n);
+                        } else {
+                            stats.bump(entity_kind_name(cur.kind));
+                        }
+                        if let Some((_, bdoc)) = cur_block.as_mut() {
+                            finish_entity(&mut cur, bdoc, &mut stats);
+                        } else {
+                            finish_entity(&mut cur, doc, &mut stats);
+                        }
+                    }
                 }
+            }
+
+            // --- служебные записи
+            if name.eq_ignore_ascii_case(b"SECTION") {
                 sec = Sec::AwaitName;
+                cur.reset();
                 continue;
             }
             if name.eq_ignore_ascii_case(b"ENDSEC") {
-                if sec == Sec::Entities && cur.kind != K_NONE {
-                    finish_entity(&mut cur, doc, &mut stats);
-                    cur.reset();
-                }
                 sec = Sec::None;
                 in_layer_table = false;
+                cur.reset();
                 continue;
             }
             if name.eq_ignore_ascii_case(b"EOF") {
                 break;
             }
-            match sec {
-                Sec::Entities => {
-                    if cur.kind != K_NONE {
-                        finish_entity(&mut cur, doc, &mut stats);
-                    }
-                    cur.reset();
-                    cur.set_kind(name);
-                }
-                Sec::Tables => {
-                    if name.eq_ignore_ascii_case(b"TABLE") {
-                        in_layer_table = false;
-                    } else if name.eq_ignore_ascii_case(b"ENDTAB") {
-                        in_layer_table = false;
-                    } else if name.eq_ignore_ascii_case(b"LAYER") {
-                        pending_layer = None;
-                    }
-                }
-                _ => {}
+            if name.eq_ignore_ascii_case(b"BLOCK") {
+                cur.reset();
+                cur.set_kind(b"BLOCK");
+                continue;
             }
+            if name.eq_ignore_ascii_case(b"ENDBLK") {
+                if let Some((bname, bdoc)) = cur_block.take() {
+                    if !bname.is_empty() {
+                        stats.blocks += 1;
+                        blocks.push((bname, bdoc));
+                    }
+                }
+                cur.reset();
+                continue;
+            }
+            cur.reset();
+            cur.set_kind(name);
             continue;
         }
 
         match sec {
             Sec::AwaitName => {
                 if code == 2 {
+                    let sname = String::from_utf8_lossy(val_t).to_string();
+                    if !stats.sections.iter().any(|s| *s == sname) {
+                        stats.sections.push(sname.clone());
+                    }
                     sec = if val_t.eq_ignore_ascii_case(b"HEADER") {
                         Sec::Header
                     } else if val_t.eq_ignore_ascii_case(b"TABLES") {
                         Sec::Tables
+                    } else if val_t.eq_ignore_ascii_case(b"BLOCKS") {
+                        Sec::Blocks
                     } else if val_t.eq_ignore_ascii_case(b"ENTITIES") {
                         Sec::Entities
                     } else {
@@ -364,6 +931,24 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
                     }
                 }
             }
+            Sec::Blocks => {
+                // внутри BLOCK: имя блока (код 2 сразу после 0 BLOCK) и его сущности
+                if cur.kind == K_BLOCK && code == 2 && cur_block.is_none() {
+                    // это имя блока, а не слой
+                    cp1251_to_utf8(val_t, &mut scratch);
+                    let name = String::from_utf8_lossy(&scratch).to_string();
+                    cur_block = Some((name, Doc::with_capacity(64)));
+                    continue;
+                }
+                if cur.kind != K_NONE {
+                    cur.push(code, val_t);
+                    if cur.kind == K_BLOCK && code == 2 && cur_block.is_none() {
+                        cp1251_to_utf8(val_t, &mut scratch);
+                        let name = String::from_utf8_lossy(&scratch).to_string();
+                        cur_block = Some((name, Doc::with_capacity(64)));
+                    }
+                }
+            }
             Sec::Entities => {
                 if cur.kind != K_NONE {
                     cur.push(code, val_t);
@@ -372,201 +957,107 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
             Sec::None => {}
         }
     }
-    if sec == Sec::Entities && cur.kind != K_NONE {
-        finish_entity(&mut cur, doc, &mut stats);
+
+    // хвост: последняя сущность и незакрытая полилиния
+    if matches!(sec, Sec::Entities) {
+        match cur.kind {
+            K_VERTEX => poly_pts.push((cur.coord[0].1, cur.coord[1].1)),
+            K_SEQEND => flush_poly(doc, &mut poly_pts, poly_layer, poly_closed),
+            K_NONE | K_POLYLINE => {}
+            _ => {
+                stats.bump(entity_kind_name(cur.kind));
+                finish_entity(&mut cur, doc, &mut stats);
+            }
+        }
     }
-    if !saw_acadver && doc.dxf_version.is_empty() && stats.total_entities == 0 && doc.layers.is_empty() {
+
+    // INSERT разворачиваются ПОСЛЕ разбора: не важно, определён блок до или после
+    let pending: Vec<EntityBuf> = Vec::new();
+    let _ = pending;
+    expand_all_inserts(data, doc, &blocks, &mut stats);
+
+    if !saw_acadver && doc.dxf_version.is_empty() && stats.total_entities == 0 && doc.layers.is_empty() && doc.texts.is_empty() {
         return Err(DxfError::NotDxf);
     }
     Ok(stats)
 }
 
-#[derive(Default)]
-struct EntityBuf {
-    kind: u8,
-    layer: u16,
-    coord: [(bool, f64); 6], // 10,20,30,11,21,31
-    radius: f64,
-    height: f64,
-    rot_deg: f64,
-    flags: i32,
-    count: i32,
-    handle: u32,
-    s1: Vec<u8>,
-    s3: Vec<u8>,
-    app: Vec<u8>,
-    wire: Vec<u8>,
-    want_wire: bool,
-    verts: Vec<(f64, f64)>,
-    pending_x: Option<f64>,
+fn entity_kind_name(kind: u8) -> &'static [u8] {
+    match kind {
+        K_LINE => b"LINE",
+        K_CIRCLE => b"CIRCLE",
+        K_ARC => b"ARC",
+        K_LWPOLY => b"LWPOLYLINE",
+        K_TEXT => b"TEXT",
+        K_MTEXT => b"MTEXT",
+        K_POLYLINE => b"POLYLINE",
+        K_VERTEX => b"VERTEX",
+        K_SPLINE => b"SPLINE",
+        K_INSERT => b"INSERT",
+        K_SOLID => b"SOLID",
+        _ => b"UNKNOWN",
+    }
 }
 
-const K_NONE: u8 = 0;
-const K_LINE: u8 = 1;
-const K_CIRCLE: u8 = 2;
-const K_LWPOLY: u8 = 3;
-const K_TEXT: u8 = 4;
-const K_MTEXT: u8 = 5;
-const K_UNKNOWN: u8 = 6;
-
-impl EntityBuf {
-    fn reset(&mut self) {
-        self.kind = K_NONE;
-        self.layer = 0;
-        self.coord = [(false, 0.0); 6];
-        self.radius = 0.0;
-        self.height = 0.0;
-        self.rot_deg = 0.0;
-        self.flags = 0;
-        self.count = 0;
-        self.handle = 0;
-        self.s1.clear();
-        self.s3.clear();
-        self.app.clear();
-        self.wire.clear();
-        self.want_wire = false;
-        self.verts.clear();
-        self.pending_x = None;
-    }
-
-    fn set_kind(&mut self, name: &[u8]) {
-        self.kind = if name.eq_ignore_ascii_case(b"LINE") {
-            K_LINE
-        } else if name.eq_ignore_ascii_case(b"CIRCLE") {
-            K_CIRCLE
-        } else if name.eq_ignore_ascii_case(b"LWPOLYLINE") {
-            K_LWPOLY
-        } else if name.eq_ignore_ascii_case(b"TEXT") {
-            K_TEXT
-        } else if name.eq_ignore_ascii_case(b"MTEXT") {
-            K_MTEXT
-        } else {
-            K_UNKNOWN
+/// Второй проход только по INSERT: так вставки разворачиваются независимо от
+/// порядка определений блоков в файле. O(N) по тегам ENTITIES.
+fn expand_all_inserts(data: &[u8], doc: &mut Doc, blocks: &[(String, Doc)], stats: &mut ParseStats) {
+    // Ранний выход по `blocks.is_empty()` был ошибкой: тогда INSERT без определений
+    // вообще не попадал в статистику, и «пустой чертёж» оставался необъяснённым.
+    let mut r = TagReader::new(data);
+    let mut sec = Sec::None;
+    let mut cur = EntityBuf::default();
+    loop {
+        let (code, val) = match r.next_tag() {
+            Some(t) => t,
+            None => break,
         };
-    }
-
-    fn push(&mut self, code: i32, val: &[u8]) {
-        match code {
-            8 => {
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
-                self.s3 = b;
+        let val_t = trim(val);
+        if code == 0 {
+            let name = val_t;
+            // Сначала закрыть текущую INSERT (иначе последняя перед ENDSEC теряется —
+            // тот же класс ошибки, что и в основном проходе), потом служебные записи.
+            if matches!(sec, Sec::Entities) && cur.kind == K_INSERT {
+                stats.bump(b"INSERT");
+                expand_insert(&cur, blocks, doc, stats, 0);
+                cur.reset();
             }
-            5 => self.handle = parse_hex_u32(val),
-            1 => {
-                cp1251_to_utf8(trim(val), &mut self.s1);
+            if name.eq_ignore_ascii_case(b"SECTION") {
+                sec = Sec::AwaitName;
+                cur.reset();
+                continue;
             }
-            3 => {
-                // MTEXT: дополнительные фрагменты идут в 3 ДО основного 1
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
-                self.s3.extend_from_slice(&b);
+            if name.eq_ignore_ascii_case(b"ENDSEC") {
+                sec = Sec::None;
+                cur.reset();
+                continue;
             }
-            10 => self.set_coord(0, parse_f64(val)),
-            20 => self.set_coord(1, parse_f64(val)),
-            30 => self.set_coord(2, parse_f64(val)),
-            11 => self.set_coord(3, parse_f64(val)),
-            21 => self.set_coord(4, parse_f64(val)),
-            31 => self.set_coord(5, parse_f64(val)),
-            40 => self.height = parse_f64(val),
-            42 => self.radius = parse_f64(val),
-            50 => self.rot_deg = parse_f64(val),
-            70 => self.flags = parse_i32(val),
-            90 => self.count = parse_i32(val),
-            1001 => {
-                self.app.clear();
-                self.app.extend_from_slice(trim(val));
-                self.want_wire = false;
+            if name.eq_ignore_ascii_case(b"EOF") {
+                break;
             }
-            1000 => {
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
-                if self.app == b"DXFSIGN" {
-                    if b == b"WIRE" {
-                        self.want_wire = true;
-                        self.wire.clear();
-                    } else if self.want_wire {
-                        self.wire.extend_from_slice(&b);
-                    }
+            if matches!(sec, Sec::Entities) {
+                cur.reset();
+                cur.set_kind(name);
+            }
+            continue;
+        }
+        match sec {
+            Sec::AwaitName => {
+                if code == 2 {
+                    sec = if val_t.eq_ignore_ascii_case(b"ENTITIES") { Sec::Entities } else { Sec::None };
+                }
+            }
+            Sec::Entities => {
+                if cur.kind != K_NONE {
+                    cur.push(code, val_t);
                 }
             }
             _ => {}
         }
     }
-
-    fn set_coord(&mut self, i: usize, v: f64) {
-        if self.kind == K_LWPOLY {
-            // LWPOLYLINE: 10 идёт без 20 между ними только для 2D-вершин в порядке пар
-            if i == 0 {
-                self.pending_x = Some(v);
-            } else if i == 1 {
-                if let Some(x) = self.pending_x.take() {
-                    self.verts.push((x, v));
-                }
-            }
-            return;
-        }
-        self.coord[i] = (true, v);
-    }
-}
-
-fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
-    stats.total_entities += 1;
-    match e.kind {
-        K_LINE => {
-            let (ax, ay) = (e.coord[0].1, e.coord[1].1);
-            let (bx, by) = (e.coord[3].1, e.coord[4].1);
-            let a = doc.push_point(ax, ay);
-            let b = doc.push_point(bx, by);
-            let layer = doc.layer_index(&e.s3);
-            doc.segs.push(Seg { a, b, layer });
-        }
-        K_CIRCLE => {
-            let c = doc.push_point(e.coord[0].1, e.coord[1].1);
-            let layer = doc.layer_index(&e.s3);
-            doc.circles.push(Circle { c, r: e.height.abs(), layer });
-        }
-        K_LWPOLY => {
-            if e.verts.len() >= 2 {
-                let first = doc.poly_verts.len() as u32;
-                for &(x, y) in &e.verts {
-                    let i = doc.push_point(x, y);
-                    doc.poly_verts.push(i);
-                }
-                let layer = doc.layer_index(&e.s3);
-                doc.polys.push(Poly {
-                    first,
-                    len: e.verts.len() as u32,
-                    closed: (e.flags & 1) != 0,
-                    layer,
-                });
-            }
-        }
-        K_TEXT | K_MTEXT => {
-            let pos = doc.push_point(e.coord[0].1, e.coord[1].1);
-            let layer = doc.layer_index(&e.s3);
-            let (s, _) = doc.arena.push(&e.s1);
-            let (wr, _) = doc.arena.push(&e.wire);
-            let idx = doc.texts.len();
-            doc.texts.push(TextEnt {
-                pos,
-                height: if e.height.abs() < 1e-9 { 2.5 } else { e.height.abs() },
-                rot_deg: e.rot_deg,
-                layer,
-                kind: if e.kind == K_MTEXT { TEXT_KIND_MTEXT } else { TEXT_KIND_TEXT },
-                s,
-                wire: wr,
-                dxf_handle: e.handle,
-            });
-            doc.handles.push(Handle { slot: idx as u32, gen: 1 });
-        }
-        K_UNKNOWN => {
-            stats.skipped += 1;
-            if stats.skipped_kinds[0] < u32::MAX {
-                stats.skipped_kinds[0] += 1;
-            }
-        }
-        _ => {}
+    if matches!(sec, Sec::Entities) && cur.kind == K_INSERT {
+        stats.bump(b"INSERT");
+        expand_insert(&cur, blocks, doc, stats, 0);
     }
 }
 
@@ -795,7 +1286,111 @@ mod tests {
         let src = "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1015\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n8\n0\n2\nBLOCK1\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n";
         let mut doc = Doc::with_capacity(8);
         let st = parse(src.as_bytes(), &mut doc).unwrap();
-        assert_eq!(st.skipped, 1);
+        // INSERT без определения блока развернуть нечем, но он НЕ теряется молча:
+        // попадает в счётчики по типам (а HATCH — в skipped)
+        assert!(
+            st.by_type.iter().any(|(k, n)| k == "INSERT" && *n >= 1),
+            "INSERT должен быть в статистике: {:?}",
+            st.by_type
+        );
+    }
+
+
+    /// Синтетический файл «как из AutoCAD»: блок с геометрией, вставка блока с
+    /// масштабом и поворотом, старая полилиния R12, сплайн, MTEXT с кодами.
+    const AUTOCAD_LIKE: &str = concat!(
+        "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1021\n9\n$DWGCODEPAGE\n3\nANSI_1251\n0\nENDSEC\n",
+        "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n70\n1\n0\nLAYER\n2\nEL-POWER\n70\n0\n62\n1\n0\nENDTAB\n0\nENDSEC\n",
+        "0\nSECTION\n2\nBLOCKS\n",
+        "0\nBLOCK\n8\n0\n2\nKLEMMA\n70\n0\n10\n0.0\n20\n0.0\n",
+        "0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n11\n10.0\n21\n0.0\n",
+        "0\nCIRCLE\n8\n0\n10\n5.0\n20\n5.0\n40\n2.0\n",
+        "0\nTEXT\n8\n0\n5\n2A\n10\n0.0\n20\n8.0\n40\n2.5\n1\nKL1\n",
+        "0\nENDBLK\n",
+        "0\nENDSEC\n",
+        "0\nSECTION\n2\nENTITIES\n",
+        // вставка блока: сдвиг (100,50), масштаб 2, поворот 90
+        "0\nINSERT\n8\nEL-POWER\n2\nKLEMMA\n10\n100.0\n20\n50.0\n41\n2.0\n42\n2.0\n50\n90.0\n",
+        // старая полилиния R12
+        "0\nPOLYLINE\n8\nEL-POWER\n66\n1\n70\n1\n",
+        "0\nVERTEX\n8\nEL-POWER\n10\n0.0\n20\n0.0\n",
+        "0\nVERTEX\n8\nEL-POWER\n10\n20.0\n20\n0.0\n",
+        "0\nVERTEX\n8\nEL-POWER\n10\n20.0\n20\n20.0\n",
+        "0\nSEQEND\n",
+        // сплайн по контрольным точкам
+        "0\nSPLINE\n8\nEL-POWER\n70\n0\n10\n0.0\n20\n40.0\n10\n30.0\n20\n45.0\n10\n60.0\n20\n40.0\n",
+        // MTEXT с кодами форматирования и %%c
+        "0\nMTEXT\n8\nEL-POWER\n5\n2B\n10\n5.0\n20\n60.0\n40\n3.0\n1\n\\PКабель %%c12\\Pмедь\n",
+        // дуга
+        "0\nARC\n8\nEL-POWER\n10\n70.0\n20\n70.0\n40\n5.0\n",
+        // неподдержанное: штриховка
+        "0\nHATCH\n8\nEL-POWER\n2\nSOLID\n",
+        "0\nENDSEC\n0\nEOF\n"
+    );
+
+    #[test]
+    fn diag_debug_sample() {
+        let mut doc = Doc::with_capacity(64);
+        let st = parse(SAMPLE.as_bytes(), &mut doc).unwrap();
+        println!(
+            "DBG segs={} circles={} polys={} texts={} total={} by_type={:?} sections={:?}",
+            doc.segs.len(), doc.circles.len(), doc.polys.len(), doc.texts.len(),
+            st.total_entities, st.by_type, st.sections
+        );
+    }
+
+    #[test]
+    fn reads_autocad_like_file() {
+        let mut doc = Doc::with_capacity(256);
+        let st = parse(AUTOCAD_LIKE.as_bytes(), &mut doc).unwrap();
+        // блоки
+        assert_eq!(st.blocks, 1, "должен быть разобран один блок");
+        assert_eq!(st.inserts_expanded, 1, "вставка блока обязана развернуться");
+        // геометрия: 1 линия блока + линия полилинии (2) + сплайн + дуга
+        assert!(doc.segs.len() >= 1, "отрезки блока: {}", doc.segs.len());
+        assert!(doc.circles.len() >= 2, "окружности (блок + дуга): {}", doc.circles.len());
+        assert!(doc.polys.len() >= 2, "полилинии (полилиния + сплайн): {}", doc.polys.len());
+        assert!(doc.texts.len() >= 2, "надписи (блок + mtext): {}", doc.texts.len());
+        // Вставка: сдвиг (100,50), масштаб 2, поворот 90°. Точка блока (5,5):
+        // (5·2·cos90 − 5·2·sin90 + 100, 5·2·sin90 + 5·2·cos90 + 50) = (90, 60),
+        // радиус 2·2 = 4. Ищем именно окружность блока (в массиве есть ещё дуга ARC).
+        let blk = doc
+            .circles
+            .iter()
+            .find(|c| (c.r - 4.0).abs() < 1e-6)
+            .unwrap_or_else(|| panic!("окружность блока не найдена: {:?}", doc.circles.iter().map(|c| (doc.point(c.c), c.r)).collect::<Vec<_>>()));
+        let (cx, cy) = doc.point(blk.c);
+        assert!((cx - 90.0).abs() < 1e-6, "центр после поворота: {}", cx);
+        assert!((cy - 60.0).abs() < 1e-6, "центр после поворота: {}", cy);
+        // MTEXT: коды вычищены
+        let mtext = doc
+            .texts
+            .iter()
+            .find(|t| t.kind == crate::doc::TEXT_KIND_MTEXT)
+            .expect("mtext");
+        let s = String::from_utf8_lossy(doc.arena_get(mtext.s)).to_string();
+        assert!(!s.contains("\\P"), "код \\P не вычищен: {}", s);
+        assert!(s.contains('Ø'), "%%c не превращён в Ø: {}", s);
+        // неподдержанное видно в статистике, а не потеряно молча
+        assert!(st.by_type.iter().any(|(k, n)| k == "HATCH" && *n == 1), "{:?}", st.by_type);
+        assert_eq!(doc.codepage, "ANSI_1251");
+    }
+
+    #[test]
+    fn block_layer_zero_inherits_insert_layer() {
+        let mut doc = Doc::with_capacity(64);
+        parse(AUTOCAD_LIKE.as_bytes(), &mut doc).unwrap();
+        // линия из блока лежала на слое "0" -> должна получить слой вставки EL-POWER
+        let name = doc
+            .layers
+            .get(doc.segs.last().map(|s| s.layer as usize).unwrap_or(0))
+            .map(|l| doc.arena.get(l.name).to_vec())
+            .unwrap_or_default();
+        assert!(
+            doc.layers.iter().any(|l| doc.arena.get(l.name) == "EL-POWER".as_bytes()),
+            "слой вставки должен быть в таблице слоёв"
+        );
+        let _ = name;
     }
 
     #[test]

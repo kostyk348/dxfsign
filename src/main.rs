@@ -194,6 +194,35 @@ fn cmd_inspect(args: &[String]) {
     }
 }
 
+/// Диагностика реального файла: секции, счётчики по типам, блоки.
+/// Нужна, когда «DXF не читается»: по выводу видно, что именно внутри.
+fn cmd_report(args: &[String]) {
+    let path = args.get(1).cloned().unwrap_or_else(|| die("report: нужен путь к .dxf"));
+    let (d, st) = load_doc(&path);
+    println!("файл:            {}", d.path);
+    println!("размер:          {} КБ", std::fs::metadata(&path).map(|m| m.len() / 1024).unwrap_or(0));
+    println!("DXF-версия:      {}", if d.dxf_version.is_empty() { "не задана" } else { &d.dxf_version });
+    println!("кодовая страница: {}", if d.codepage.is_empty() { "не задана" } else { &d.codepage });
+    println!("секции:          {}", if st.sections.is_empty() { "—".to_string() } else { st.sections.join(", ") });
+    println!("блоков:          {}   вставок развёрнуто: {}", st.blocks, st.inserts_expanded);
+    println!("сущностей всего: {}   неподдержано: {}", st.total_entities, st.skipped);
+    println!("по типам:        {}", st.summary());
+    println!("--- прочитано в модель ---");
+    println!("LINE {} · CIRCLE {} · LWPOLYLINE {} · TEXT/MTEXT {} · точек {} · слоёв {}",
+        d.segs.len(), d.circles.len(), d.polys.len(), d.texts.len(), d.xs.len(), d.layers.len());
+    if d.segs.is_empty() && d.circles.is_empty() && d.polys.is_empty() && d.texts.is_empty() {
+        println!("\nМодель пуста. Наиболее вероятные причины:");
+        println!("  1. геометрия внутри блоков, а INSERT не развернулся (см. блоков/вставок выше);");
+        println!("  2. файл бинарный DXF (первые байты не текстовые) — бинарный формат не поддержан;");
+        println!("  3. сущности только из неподдержанных типов (HATCH/DIMENSION/LEADER) — см. «по типам».");
+    }
+    if let Ok(head) = std::fs::read(&path) {
+        if head.first() == Some(&b'A') && head.get(1) == Some(&b'u') {
+            println!("  4. первые байты «AutoCAD Binary DXF» — это бинарный DXF, нужен конвертер.");
+        }
+    }
+}
+
 fn cmd_edit(args: &[String]) {
     let path = args.get(1).cloned().unwrap_or_else(|| die("edit: нужен путь к .dxf"));
     let (mut d, _) = load_doc(&path);
@@ -630,6 +659,7 @@ dxfsign — просмотр и правка DXF на сетевом диске;
 
 команды:
   inspect  <файл.dxf>
+  report   <файл.dxf>   — что внутри файла: секции, типы сущностей, блоки, вставки
   edit     <файл.dxf> --idx N --text \"...\" --wire W-1 [--comment \"...\"]
   save     <файл.dxf|файл.edited.dxf> [--config cfg.ini] [--seq N] [--now UNIX] [--working путь]
   snapshot <файл.dxf> --out кадр.bmp [--w 1440 --h 900] [--modal] [--idx N]
@@ -678,6 +708,7 @@ fn main() {
         }
         "--help" | "-h" | "help" => usage(),
         "inspect" => cmd_inspect(&args[1..]),
+        "report" => cmd_report(&args[1..]),
         "edit" => cmd_edit(&args[1..]),
         "save" => cmd_save(&args[1..]),
         "snapshot" => cmd_snapshot(&args[1..]),

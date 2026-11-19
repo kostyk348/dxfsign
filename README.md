@@ -26,7 +26,11 @@ dxfsign.exe --version
 
 ## Что умеет
 
-* читает и пишет ASCII DXF: `LINE`, `CIRCLE`, `LWPOLYLINE`, `TEXT`, `MTEXT` (+ кодировка CP1251 по `$DWGCODEPAGE`);
+* читает ASCII DXF: `LINE`, `CIRCLE`, `ARC`, `LWPOLYLINE`, старая `POLYLINE`+`VERTEX`, `SPLINE`,
+  `SOLID`, `TEXT`/`ATTRIB`, `MTEXT` (с чисткой кодов форматирования), **`BLOCKS` + `INSERT`**
+  (масштаб, поворот, наследование слоя «0»); кодировка CP1251 по `$DWGCODEPAGE`;
+* пишет обратно `LINE`, `CIRCLE`, `LWPOLYLINE`, `TEXT`, `MTEXT` (блоки при записи разворачиваются
+  в геометрию — это названное ограничение);
 * правит **текст надписи** — это главный сценарий: выбор кликом, `F2`, ввод, `Enter`;
 * после правки **обязательно спрашивает номер провода** — без него правка не применяется;
 * позволяет оставить **свободный комментарий**, он идёт в перечень предлагаемых изменений;
@@ -53,6 +57,7 @@ dxfsign.exe
 dxfsign.exe open Z:\projects\itp-3\plan.dxf
 
 :: консольный сценарий
+dxfsign.exe report plan.dxf      :: что внутри файла: секции, блоки, типы сущностей
 dxfsign.exe inspect plan.dxf
 dxfsign.exe edit plan.dxf --idx 1 --text "QF1 Ввод 1 (заменён)" --wire W-101 --comment "по замечанию ПТО"
 dxfsign.exe save plan.dxf.edited.dxf --config dxfsign.ini --working plan.dxf
