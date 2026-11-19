@@ -1,6 +1,6 @@
 [package]
 name = "dxfsign"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2021"
 rust-version = "1.77"
 description = "DXF viewer/editor for a network drive: every save is signed and mailed as .eml, with a .txt change list"

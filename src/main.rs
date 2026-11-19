@@ -837,19 +837,18 @@ fn cmd_probe(args: &[String]) -> i32 {
 
 fn cmd_open(args: &[String]) -> i32 {
     let selftest: u32 = arg_val(args, "--selftest").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut d = match args.get(1) {
-        Some(p) if !p.starts_with("--") => {
-            let (mut d, _) = load_doc(p);
-            d.path.clear();
-            d.path.push_str(p);
-            d
-        }
-        _ => demo_doc(),
+    // Демонстрационного чертежа больше нет: он и был причиной пустой канвы —
+    // его маленький буфер проекции оставался для настоящего файла. Теперь без
+    // файла открывается пустое окно с подсказкой, а не выдуманная геометрия.
+    let path = match args.get(1) {
+        Some(p) if !p.starts_with("--") => Some(p.clone()),
+        _ => None,
     };
-    if d.path.is_empty() {
-        set_demo_path(&mut d, selftest);
+    let mut d = doc::Doc::with_capacity(1024);
+    if let Some(p) = &path {
+        d.path.push_str(p);
     }
-    let title = if d.path.is_empty() { "демо-чертёж (не файл)".to_string() } else { d.path.clone() };
+    let title = path.clone().unwrap_or_else(|| "файл не открыт".to_string());
     // конфиг: явный --config, иначе dxfsign.ini рядом с exe, иначе значения по умолчанию
     let cfg_path = arg_val(args, "--config").unwrap_or_else(|| {
         let exe = std::env::current_exe().unwrap_or_default();
@@ -863,11 +862,7 @@ fn cmd_open(args: &[String]) -> i32 {
         load_config(Some(cfg_path.clone()))
     };
     // Если путь задан — отдаём его окну для фоновой загрузки, а не читаем здесь.
-    let initial = if d.path.is_empty() { None } else { Some(d.path.clone()) };
-    if initial.is_some() {
-        d = demo_doc();
-        d.path.clear();
-    }
+    let initial = path.clone();
     window::run(d, 1440, 900, &title, Some(window_save), selftest, cfg, cfg_path, initial)
 }
 

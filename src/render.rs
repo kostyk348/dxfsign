@@ -707,6 +707,17 @@ pub struct Renderer {
     pub seg_step: usize,
     /// Длительность последнего кадра, мс (адаптация шага и статус).
     pub frame_ms: f32,
+    /// Время геометрии и время текста отдельно — по ним видно, что тормозит.
+    pub geom_ms: f32,
+    pub text_ms: f32,
+    /// Сколько надписей рисуем за кадр. Сначала мало, растёт если кадр лёгкий:
+    /// один «толстый» кадр на 571 надпись — это и было зависание.
+    pub text_per_frame: usize,
+    /// Аварийный режим: текст не рисуется вовсе (только засечки). Включается сам,
+    /// если кадр не уложился в 2 с, и переключается клавишей F9.
+    pub safe_mode: bool,
+    /// Сколько надписей не нарисовано в этом кадре (показывается в статусе).
+    pub texts_skipped: usize,
 }
 
 impl Renderer {
@@ -721,6 +732,11 @@ impl Renderer {
             texts_drawn: 0,
             seg_step: 1,
             frame_ms: 0.0,
+            geom_ms: 0.0,
+            text_ms: 0.0,
+            text_per_frame: 64,
+            safe_mode: false,
+            texts_skipped: 0,
         }
     }
 
@@ -798,15 +814,33 @@ impl Renderer {
         // --- надписи: то, что правится; выделенная — красной рамкой.
         // Бюджет на кадр: выделенная надпись рисуется всегда, остальные — пока хватает
         // бюджета; сверх бюджета ставятся засечки (LOD), и это видно в статусе.
-        let budget = self.text_budget.max(64);
+        let budget = self.text_budget.max(64).min(self.text_per_frame.max(16));
+        let geometry_done = frame_t0.elapsed().as_secs_f32() * 1000.0;
+        self.geom_ms = geometry_done;
         let mut drawn = 0usize;
         let mut ticks = 0usize;
+        self.texts_skipped = 0;
         for (ti, t) in doc.texts.iter().enumerate() {
             if drawn >= self.text_draw_cap {
                 break;
             }
             let selected_now = ui.selected_text == Some(ti);
             if drawn >= budget && !selected_now {
+                self.texts_skipped += 1;
+                let i = t.pos as usize;
+                if i < self.sx.len() {
+                    let (px, py) = (vx + self.sx[i], vy + self.sy[i]);
+                    if on_screen(px, py) {
+                        self.fb.fill_rect(px - 2, py - 2, 4, 4, swiss::MUTED);
+                        ticks += 1;
+                    }
+                }
+                continue;
+            }
+            // Аварийный режим: текст не рисуется, только засечки — чертёж видно,
+            // GDI в кадре не вызывается вовсе.
+            if self.safe_mode && !selected_now && !ui.hover_text.eq(&Some(ti)) {
+                self.texts_skipped += 1;
                 let i = t.pos as usize;
                 if i < self.sx.len() {
                     let (px, py) = (vx + self.sx[i], vy + self.sy[i]);
@@ -1066,8 +1100,24 @@ impl Renderer {
         let fw = tp.measure(swiss::T_CAPTION, false, fname);
         tp.text(&mut self.fb, w - swiss::MARGIN - fw, h - swiss::STATUS_H + 13, swiss::T_CAPTION, false, swiss::MUTED, fname);
 
+        // Пустое состояние: вместо пустой канвы — что делать дальше.
+        if doc.entity_count() == 0 {
+            let msg = "ФАЙЛ НЕ ОТКРЫТ · Ctrl+O или перетащите .dxf в окно · F4 — каталог";
+            let tw = tp.measure(swiss::T_LABEL, true, msg);
+            tp.text(
+                &mut self.fb,
+                vx + (vw0 - tw) / 2,
+                vy + vh0 / 2,
+                swiss::T_LABEL,
+                true,
+                swiss::MUTED,
+                msg,
+            );
+        }
+
         // --- модальный запрос номера провода и комментария
         self.frame_ms = frame_t0.elapsed().as_secs_f32() * 1000.0;
+        self.text_ms = (self.frame_ms - self.geom_ms).max(0.0);
         // Бюджет надписей подстраивается под реальную скорость машины: если кадр
         // не укладывается в 40 мс, рисуем меньше надписей (прореживание видно в
         // статусе), а не «зависаем» на старом CPU.

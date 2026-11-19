@@ -220,6 +220,7 @@ const VK_F2: usize = 0x71;
 const VK_F3: usize = 0x72;
 const VK_F4: usize = 0x73;
 const VK_F5: usize = 0x74;
+const VK_F9: usize = 0x78;
 const VK_F7: usize = 0x76;
 const VK_INSERT: usize = 0x2D;
 const VK_DELETE: usize = 0x2E;
@@ -389,7 +390,28 @@ fn render_and_present() {
     };
     c.ui.focus = c.focus;
     let session = &c.session;
-    let _ = c.renderer.frame(&c.doc, c.cam, &mut c.ui, session, &mut c.painter);
+    match c.renderer.frame(&c.doc, c.cam, &mut c.ui, session, &mut c.painter) {
+        Ok(()) => {}
+        Err(e) => {
+            // Молча глотать ошибку кадра нельзя: именно из-за этого экран был
+            // пустым без единого сообщения.
+            let need = c.doc.xs.len().max(64) + 1024;
+            crate::startup_log(&format!("ошибка кадра: {:?} — увеличиваю буфер до {}", e, need));
+            c.renderer.sx.resize(need, 0);
+            c.renderer.sy.resize(need, 0);
+            c.renderer.points_cap = need;
+            match c.renderer.frame(&c.doc, c.cam, &mut c.ui, session, &mut c.painter) {
+                Ok(()) => {
+                    c.ui.set_last("буфер проекции увеличен под чертёж");
+                }
+                Err(e2) => {
+                    crate::startup_log(&format!("кадр не рисуется: {:?}", e2));
+                    let msg = format!("Кадр не рисуется: {:?}", e2);
+                    c.ui.set_last(&msg);
+                }
+            }
+        }
+    }
     if c.pending.is_some() {
         draw_loading();
     }
@@ -725,11 +747,15 @@ fn install_doc(doc: Doc, msg: String) {
     c.ui.selected_text = if c.doc.texts.is_empty() { None } else { Some(0) };
     c.ui.texts_scroll = 0;
     c.ui.set_file(&path);
-    let points = c.doc.xs.len().max(64) * 2;
+    // Буфер проекции ОБЯЗАН вмещать все точки чертежа. Раньше он оставался от
+    // демонстрационного чертежа, `frame()` возвращал Overflow, окно молча
+    // глотало ошибку — и канва оставалась пустой («ничего не открылось»).
+    let points = c.doc.xs.len().max(64) + 1024;
     c.renderer.sx.clear();
     c.renderer.sy.clear();
     c.renderer.sx.resize(points, 0);
     c.renderer.sy.resize(points, 0);
+    c.renderer.points_cap = points;
     // Первый кадр большого чертежа: сразу берём шаг прореживания, иначе открытие
     // отдаёт одно «тяжёлое» подвисание ещё до первой отрисовки.
     let segs = c.doc.segs.len();
@@ -977,15 +1003,31 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             // без догадок, и видно, какой был бюджет надписей.
             let c = ctx();
             c.frames += 1;
-            if c.frames == 1 || c.renderer.frame_ms > 500.0 {
+            // Замер по фазам: видно, геометрия тормозит или текст, и сработал ли
+            // аварийный режим.
+            if c.frames <= 3 || c.renderer.frame_ms > 500.0 {
                 crate::startup_log(&format!(
-                    "кадр №{}: {:.0} мс (надписей {}, бюджет {}, объектов {})",
+                    "кадр №{}: {:.0} мс (геометрия {:.0}, текст {:.0}) · надписей {} из {}, порция {}, без текста: {}",
                     c.frames,
                     c.renderer.frame_ms,
+                    c.renderer.geom_ms,
+                    c.renderer.text_ms,
+                    c.renderer.texts_skipped as u64,
                     c.doc.texts.len(),
-                    c.renderer.text_budget,
-                    c.doc.entity_count()
+                    c.renderer.text_per_frame,
+                    if c.renderer.safe_mode { "да" } else { "нет" }
                 ));
+            }
+            // Медленный кадр → аварийный режим (без GDI-текста) и меньшая порция.
+            if c.renderer.frame_ms > 2000.0 && !c.renderer.safe_mode {
+                c.renderer.safe_mode = true;
+                c.renderer.text_per_frame = 8;
+                crate::startup_log("ВКЛЮЧЁН РЕЖИМ БЕЗ ТЕКСТА: кадр дольше 2 с (F9 — вернуть надписи)");
+                set_flash("Кадр слишком медленный: надписи отключены (F9 — включить обратно)");
+            } else if c.renderer.frame_ms > 60.0 {
+                c.renderer.text_per_frame = (c.renderer.text_per_frame / 2).max(8);
+            } else if c.renderer.frame_ms < 16.0 {
+                c.renderer.text_per_frame = (c.renderer.text_per_frame * 2).min(1200);
             }
             0
         }
@@ -1322,7 +1364,22 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                             c.editor.note("Запись удалена и каталог сохранён");
                         }
                     }
-                    VK_F5 => {
+                    VK_F9 => {
+                    let c = ctx();
+                    c.renderer.safe_mode = !c.renderer.safe_mode;
+                    if !c.renderer.safe_mode {
+                        c.renderer.text_per_frame = 64;
+                    }
+                    let msg = if c.renderer.safe_mode {
+                        "Надписи отключены (F9 — включить)"
+                    } else {
+                        "Надписи включены"
+                    };
+                    crate::startup_log(msg);
+                    set_flash(msg);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                VK_F5 => {
                         let cur = c.editor.path.as_bytes().to_vec();
                         let init = if cur.is_empty() { None } else { Some(String::from_utf8_lossy(&cur).to_string()) };
                         if let Some(p) = dialogs::pick_folder(hwnd, "Папка сетевого диска") {
@@ -1427,6 +1484,21 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                         run_tool(1);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
+                }
+                VK_F9 => {
+                    let c = ctx();
+                    c.renderer.safe_mode = !c.renderer.safe_mode;
+                    if !c.renderer.safe_mode {
+                        c.renderer.text_per_frame = 64;
+                    }
+                    let msg = if c.renderer.safe_mode {
+                        "Надписи отключены (F9 — включить)"
+                    } else {
+                        "Надписи включены"
+                    };
+                    crate::startup_log(msg);
+                    set_flash(msg);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 VK_F5 => {
                     // Куда складывать .eml. Выбранная папка пишется в ini, поэтому
