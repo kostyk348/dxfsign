@@ -817,15 +817,25 @@ impl Renderer {
                 }
                 continue;
             }
-            drawn += 1;
             let i = t.pos as usize;
-            let px = ((t.height * cam.scale) as i32).clamp(16, 72);
+            if i >= self.sx.len() {
+                continue;
+            }
             let x = vx + self.sx[i];
             let y = vy + self.sy[i];
+            // За пределами канвы не рисуем и не измеряем вовсе.
+            if x < vx - 600 || x > vx + vw0 + 600 || y < vy - 60 || y > vy + vh0 + 60 {
+                continue;
+            }
+            drawn += 1;
+            let px = ((t.height * cam.scale) as i32).clamp(16, 72);
             let selected = ui.selected_text == Some(ti);
             let hovered = ui.hover_text == Some(ti) && !selected;
             let s = String::from_utf8_lossy(doc.arena_get(t.s));
-            let wd = tp.measure(px, false, &s);
+            // Ширина для рамки — арифметикой, без вызова GDI: раньше `measure`
+            // вызывался на КАЖДУЮ надпись (плюс второй раз внутри `text`), и на 571
+            // надписи это 1142 GDI-вызова в кадре — на Win7 кадр вставал.
+            let wd = (s.chars().count() as i32 * px * 55 / 100).max(px / 2);
             if selected {
                 // выделение обязано быть видно: рамка 3 px, метка 6 px и линия под
                 // базовой линией. Рамка 2 px на мелком кегле терялась.
@@ -1058,6 +1068,14 @@ impl Renderer {
 
         // --- модальный запрос номера провода и комментария
         self.frame_ms = frame_t0.elapsed().as_secs_f32() * 1000.0;
+        // Бюджет надписей подстраивается под реальную скорость машины: если кадр
+        // не укладывается в 40 мс, рисуем меньше надписей (прореживание видно в
+        // статусе), а не «зависаем» на старом CPU.
+        if self.frame_ms > 40.0 && self.text_budget > 200 {
+            self.text_budget = (self.text_budget / 2).max(200);
+        } else if self.frame_ms < 14.0 && self.text_budget < 1200 {
+            self.text_budget = (self.text_budget + 100).min(1200);
+        }
         if ui.help_open {
             let fields: [(&str, &str, bool); 5] = [
                 ("МЫШЬ", "клик — выбрать · 2×клик — править · колесо — зум", false),

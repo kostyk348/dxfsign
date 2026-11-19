@@ -285,6 +285,8 @@ struct PendingLoad {
 struct Ctx {
     cfg: AppConfig,
     pending: Option<PendingLoad>,
+    /// Сколько кадров нарисовано: по первому кадру видно, тормозит ли машина.
+    frames: u64,
     cfg_path: String,
     editor: CatEditor,
     doc: Doc,
@@ -717,6 +719,9 @@ fn install_doc(doc: Doc, msg: String) {
     let c = ctx();
     let path = doc.path.clone();
     c.doc = doc;
+    // Счётчик кадров сбрасываем: первый кадр НОВОГО чертежа — самое важное число
+    // для диагностики на чужой машине.
+    c.frames = 0;
     c.ui.selected_text = if c.doc.texts.is_empty() { None } else { Some(0) };
     c.ui.texts_scroll = 0;
     c.ui.set_file(&path);
@@ -968,6 +973,20 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
     match msg {
         WM_PAINT => {
             render_and_present();
+            // Медленный кадр пишем в журнал: тогда «висит» отличается от «тормозит»
+            // без догадок, и видно, какой был бюджет надписей.
+            let c = ctx();
+            c.frames += 1;
+            if c.frames == 1 || c.renderer.frame_ms > 500.0 {
+                crate::startup_log(&format!(
+                    "кадр №{}: {:.0} мс (надписей {}, бюджет {}, объектов {})",
+                    c.frames,
+                    c.renderer.frame_ms,
+                    c.doc.texts.len(),
+                    c.renderer.text_budget,
+                    c.doc.entity_count()
+                ));
+            }
             0
         }
         WM_GETMINMAXINFO => DefWindowProcA(hwnd, msg, wp, lp),
@@ -1550,6 +1569,7 @@ pub fn run(
         let c = Box::new(Ctx {
             cfg,
             pending: None,
+            frames: 0,
             cfg_path,
             editor: CatEditor::new(),
             doc,

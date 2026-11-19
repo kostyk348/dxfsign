@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "dxfsign"
-version = "1.0.7"
+version = "1.0.8"

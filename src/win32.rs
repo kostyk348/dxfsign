@@ -88,7 +88,8 @@ mod imp {
     const DIB_RGB_COLORS: u32 = 0;
     const TRANSPARENT: i32 = 1;
     const RUSSIAN_CHARSET: u32 = 204;
-    const CLEARTYPE_QUALITY: u32 = 5;
+    const NONANTIALIASED_QUALITY: u32 = 1;
+        const CLEARTYPE_QUALITY: u32 = 5;
     // Заготовка под моноширинную «типографскую» гарнитуру швейцарской школы:
     // Helvetica/Arial есть везде, дальше — то, что обычно стоит в цеху.
     const FACE: &[u8] = b"Arial\0";
@@ -106,6 +107,31 @@ mod imp {
         pub draws: u64,
         /// Переиспользуемый буфер CP1251: конвертация без аллокации на каждый вызов.
         cp: Vec<u8>,
+        /// Кеш отрисованных строк. Надписи в чертежах повторяются («Изм.», «Лист»,
+        /// «Подп. и дата»), а каждый промах — это два вызова GDI (measure + TextOutA).
+        /// На Win7-машине 571 надпись × 2 вызова в кадре и давали «висит».
+        glyphs: Vec<Glyph>,
+        glyph_bytes: usize,
+    }
+
+    /// Готовая маска строки: 1 = закрасить, 0 = пропустить.
+    struct Glyph {
+        key: u64,
+        px: i32,
+        bold: bool,
+        w: usize,
+        rows: usize,
+        mask: Vec<u8>,
+    }
+
+    /// Хеш строки: FNV-1a. Быстро, без аллокаций, без зависимостей.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h
     }
 
     impl GdiPainter {
@@ -150,6 +176,8 @@ mod imp {
                     bits: bits as *mut u32,
                     tw,
                     th,
+                    glyphs: Vec::with_capacity(64),
+                    glyph_bytes: 0,
                     regular: Vec::with_capacity(4),
                     bold: Vec::with_capacity(4),
                     draws: 0,
@@ -176,7 +204,7 @@ mod imp {
                     RUSSIAN_CHARSET,
                     0,
                     0,
-                    CLEARTYPE_QUALITY,
+                    NONANTIALIASED_QUALITY, // жёсткие края: и по стилю, и втрое быстрее
                     0,
                     FACE.as_ptr(),
                 );
@@ -186,17 +214,27 @@ mod imp {
         }
 
         /// Отрисовать строку в буфер (UTF-8 -> CP1251) и вернуть число байт.
-        fn render_to_mask(&mut self, px: i32, bold: bool, s: &str) -> usize {
+        fn render_to_mask(&mut self, px: i32, bold: bool, s: &str, width: usize) -> usize {
             let mut cp = core::mem::take(&mut self.cp);
             utf8_to_cp1251(s.as_bytes(), &mut cp);
             let n = cp.len();
             if n > 200 {
                 cp.truncate(200);
             }
+            // Чистим только те строки, которые реально прочитаем. Раньше чистилось
+            // tw*40 = 40 960 пикселей на КАЖДУЮ надпись: на чертеже с 571 надписью
+            // это 23 млн записей в кадре, и на Win7-машине кадр вставал намертво.
+            let rows = ((px * 2 + 8).max(16)).min(self.th) as usize;
+            let clear_w = width.min(self.tw as usize).max(1);
             unsafe {
-                // фон — белый, текст — чёрный; затем маска читается из bits
-                for i in 0..(self.tw * 40) as usize {
-                    *self.bits.add(i) = 0x00FF_FFFF;
+                // Чистим ровно тот прямоугольник, который потом прочитаем:
+                // rows × ширина строки. Полная маска (1024×96) на каждую надпись —
+                // это 98 тыс. записей, и на старом CPU кадр переставал рисоваться.
+                for row in 0..rows {
+                    let base = row * self.tw as usize;
+                    for col in 0..clear_w {
+                        *self.bits.add(base + col) = 0x00FF_FFFF;
+                    }
                 }
                 let f = self.font(px, bold);
                 SelectObject(self.mem, f);
@@ -215,19 +253,43 @@ mod imp {
             if s.is_empty() {
                 return;
             }
-            self.render_to_mask(px, bold, s);
-            self.draws += 1;
-            let lines = 2.min((px / 12).max(1));
-            let rows = (px * lines + 8).min(40) as usize;
+            // Попадание в кеш — только копирование памяти, без GDI.
+            let key = fnv1a(s.as_bytes());
+            let hit = self
+                .glyphs
+                .iter()
+                .position(|g| g.key == key && g.px == px && g.bold == bold);
+            if let Some(gi) = hit {
+                let g = &self.glyphs[gi];
+                blit_glyph(fb, g, x, y, color);
+                self.draws += 1;
+                return;
+            }
+            let width = self.measure(px, bold, s).max(0) as usize;
+            if width == 0 || width > self.tw as usize {
+                return;
+            }
+            self.render_to_mask(px, bold, s, width);
+            let rows = ((px * 2 + 8).max(16)).min(self.th) as usize;
+            let mut mask = vec![0u8; width * rows];
             for row in 0..rows {
-                for col in 0..512usize.min(fb.w) {
-                    let p = unsafe { *self.bits.add(row * self.tw as usize + col) };
-                    // всё, что темнее 50% — закрашиваем цветом текста (жёсткий край)
-                    if (p & 0xFF) < 0x80 {
-                        fb.put(x + col as i32, y + row as i32, color);
-                    }
+                let base = row * self.tw as usize;
+                for col in 0..width {
+                    let p = unsafe { *self.bits.add(base + col) };
+                    mask[row * width + col] = u8::from((p & 0xFF) < 0x80);
                 }
             }
+            // Кеш не растим бесконечно: 8 МБ хватает на тысячи разных строк.
+            if self.glyph_bytes + mask.len() < 8 << 20 {
+                self.glyph_bytes += mask.len();
+                let g = Glyph { key, px, bold, w: width, rows, mask };
+                blit_glyph(fb, &g, x, y, color);
+                self.glyphs.push(g);
+            } else {
+                let g = Glyph { key, px, bold, w: width, rows, mask };
+                blit_glyph(fb, &g, x, y, color);
+            }
+            self.draws += 1;
         }
 
         fn measure(&mut self, px: i32, bold: bool, s: &str) -> i32 {
@@ -256,6 +318,18 @@ mod imp {
                 }
                 DeleteObject(self.bmp);
                 DeleteDC(self.mem);
+            }
+        }
+    }
+
+    /// Перенести готовую маску строки в кадр. O(ширина × строки).
+    fn blit_glyph(fb: &mut Framebuffer, g: &Glyph, x: i32, y: i32, color: u32) {
+        for row in 0..g.rows {
+            let base = row * g.w;
+            for col in 0..g.w {
+                if g.mask[base + col] != 0 {
+                    fb.put(x + col as i32, y + row as i32, color);
+                }
             }
         }
     }
