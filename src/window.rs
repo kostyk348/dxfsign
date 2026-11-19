@@ -153,6 +153,9 @@ extern "system" {
 extern "system" {
     fn SetCapture(hwnd: Hwnd) -> Hwnd;
     fn ReleaseCapture() -> i32;
+    fn DragAcceptFiles(hwnd: Hwnd, accept: i32);
+    fn DragQueryFileA(hdrop: isize, file_index: u32, buf: *mut u8, cch: u32) -> u32;
+    fn DragFinish(hdrop: isize);
 }
 
 #[link(name = "gdi32")]
@@ -201,6 +204,7 @@ const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_CAPTURECHANGED: u32 = 0x0215;
+const WM_DROPFILES: u32 = 0x0233;
 const WM_TIMER: u32 = 0x0113;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -629,18 +633,48 @@ fn apply_editor() {
 }
 
 fn open_path(path: &str) {
-    let data = match std::fs::read(path) {
+    let c0 = ctx();
+    let p = std::path::Path::new(path);
+    // 1) файл вообще есть?
+    let data = match std::fs::read(p) {
         Ok(d) => d,
         Err(e) => {
-            set_flash(&format!("Не читается {}: {}", path, e));
+            let msg = format!("Не открывается «{}»: {} (код {})", path, e, e.raw_os_error().unwrap_or(0));
+            c0.ui.set_last(&msg);
+            set_flash(&msg);
             return;
         }
     };
-    let mut d = Doc::with_capacity(1024);
-    if let Err(e) = crate::dxf::parse(&data, &mut d) {
-        set_flash(&format!("Разбор {}: {}", path, e));
+    // 2) понятные причины отказа вместо «не читается»
+    if data.is_empty() {
+        let msg = "Файл пустой (0 байт)".to_string();
+        c0.ui.set_last(&msg);
+        set_flash(&msg);
         return;
     }
+    if data.starts_with(b"AutoCAD Binary DXF") {
+        let msg = "Это БИНАРНЫЙ DXF (AutoCAD Binary DXF). Нужно сохранить как ASCII DXF в AutoCAD".to_string();
+        c0.ui.set_last(&msg);
+        set_flash(&msg);
+        return;
+    }
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        if ext.eq_ignore_ascii_case("dwg") {
+            let msg = "Это DWG, а не DXF: сохраните файл как DXF (Save As → DXF) в AutoCAD".to_string();
+            c0.ui.set_last(&msg);
+            set_flash(&msg);
+            return;
+        }
+    }
+    let mut d = Doc::with_capacity(1024);
+    if let Err(e) = crate::dxf::parse(&data, &mut d) {
+        let head: String = String::from_utf8_lossy(&data[..data.len().min(24)]).replace(['\r', '\n'], " ");
+        let msg = format!("Не разобран как DXF: {} | начало файла: «{}»", e, head);
+        c0.ui.set_last(&msg);
+        set_flash(&msg);
+        return;
+    }
+
     d.path.push_str(path);
     let c = ctx();
     c.doc = d;
@@ -755,6 +789,39 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                 set_flash("Панорама завершена");
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
+            0
+        }
+        WM_DROPFILES => {
+            // Перетащили файл в окно. Путь из DragQueryFileA тоже ANSI (CP1251).
+            let drop_handle = wp as isize;
+            let mut buf = [0u8; 1024];
+            let n = unsafe { DragQueryFileA(drop_handle, 0, buf.as_mut_ptr(), buf.len() as u32) };
+            if n > 0 {
+                let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                let mut utf8 = Vec::with_capacity(len + 8);
+                crate::text::cp1251_to_utf8(&buf[..len], &mut utf8);
+                let path = String::from_utf8_lossy(&utf8).to_string();
+                let c = ctx();
+                // перетаскивание папки = переход каталога, файла = открытие
+                if std::path::Path::new(&path).is_dir() {
+                    c.cfg.catalog.insert(0, crate::config::CatalogEntry {
+                        name: path.rsplit(['\\', '/']).next().unwrap_or("папка").to_string(),
+                        path: path.clone(),
+                    });
+                    c.ui.catalog_names.clear();
+                    c.ui.catalog_paths.clear();
+                    for e in &c.cfg.catalog {
+                        c.ui.catalog_names.push(e.name.clone());
+                        c.ui.catalog_paths.push(e.path.clone());
+                    }
+                    let _ = persist_cfg();
+                    set_flash(&format!("Папка добавлена в каталог: {}", path));
+                } else {
+                    open_path(&path);
+                }
+            }
+            unsafe { DragFinish(drop_handle) };
+            InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         WM_CAPTURECHANGED => {
@@ -1238,6 +1305,7 @@ pub fn run(
             return 4;
         }
         ctx().hwnd = hwnd;
+        DragAcceptFiles(hwnd, 1);
         // первичный выбор первой надписи: человек сразу видит, что можно править
         if !ctx().doc.texts.is_empty() {
             ctx().ui.selected_text = Some(0);

@@ -50,6 +50,15 @@ struct BrowseInfoA {
     i_image: i32,
 }
 
+/// Путь из ANSI-диалога приходит в CP1251. Декодировать его как UTF-8 нельзя:
+/// русские имена превращаются в мусор и файл «не читается». Один хелпер на все
+/// диалоги, чтобы эта ошибка не вернулась.
+fn ansi_to_utf8(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    crate::text::cp1251_to_utf8(bytes, &mut out);
+    String::from_utf8_lossy(&out).to_string()
+}
+
 #[link(name = "comdlg32")]
 extern "system" {
     fn GetOpenFileNameA(ofn: *mut OpenFileNameA) -> i32;
@@ -87,7 +96,8 @@ pub fn open_dxf_dialog(owner: isize, initial_dir: Option<&str>) -> Option<String
     let def_ext = b"dxf\0";
     let mut buf = [0u8; 1024];
     let init = initial_dir.map(|s| {
-        let mut v = s.as_bytes().to_vec();
+        let mut v = Vec::with_capacity(s.len() + 4);
+        crate::text::utf8_to_cp1251(s.as_bytes(), &mut v);
         v.push(0);
         v
     });
@@ -121,7 +131,7 @@ pub fn open_dxf_dialog(owner: isize, initial_dir: Option<&str>) -> Option<String
         return None;
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Some(String::from_utf8_lossy(&buf[..end]).to_string())
+    Some(ansi_to_utf8(&buf[..end]))
 }
 
 /// Диалог «Выбрать папку» (для каталога сетевого диска).
@@ -153,6 +163,6 @@ pub fn pick_folder(owner: isize, title: &str) -> Option<String> {
             return None;
         }
         let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-        Some(String::from_utf8_lossy(&path[..end]).to_string())
+        Some(ansi_to_utf8(&path[..end]))
     }
 }

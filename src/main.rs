@@ -198,27 +198,62 @@ fn cmd_inspect(args: &[String]) {
 /// Нужна, когда «DXF не читается»: по выводу видно, что именно внутри.
 fn cmd_report(args: &[String]) {
     let path = args.get(1).cloned().unwrap_or_else(|| die("report: нужен путь к .dxf"));
-    let (d, st) = load_doc(&path);
-    println!("файл:            {}", d.path);
-    println!("размер:          {} КБ", std::fs::metadata(&path).map(|m| m.len() / 1024).unwrap_or(0));
-    println!("DXF-версия:      {}", if d.dxf_version.is_empty() { "не задана" } else { &d.dxf_version });
-    println!("кодовая страница: {}", if d.codepage.is_empty() { "не задана" } else { &d.codepage });
-    println!("секции:          {}", if st.sections.is_empty() { "—".to_string() } else { st.sections.join(", ") });
-    println!("блоков:          {}   вставок развёрнуто: {}", st.blocks, st.inserts_expanded);
-    println!("сущностей всего: {}   неподдержано: {}", st.total_entities, st.skipped);
-    println!("по типам:        {}", st.summary());
-    println!("--- прочитано в модель ---");
-    println!("LINE {} · CIRCLE {} · LWPOLYLINE {} · TEXT/MTEXT {} · точек {} · слоёв {}",
-        d.segs.len(), d.circles.len(), d.polys.len(), d.texts.len(), d.xs.len(), d.layers.len());
-    if d.segs.is_empty() && d.circles.is_empty() && d.polys.is_empty() && d.texts.is_empty() {
-        println!("\nМодель пуста. Наиболее вероятные причины:");
-        println!("  1. геометрия внутри блоков, а INSERT не развернулся (см. блоков/вставок выше);");
-        println!("  2. файл бинарный DXF (первые байты не текстовые) — бинарный формат не поддержан;");
-        println!("  3. сущности только из неподдержанных типов (HATCH/DIMENSION/LEADER) — см. «по типам».");
+    // Диагностика НЕ должна падать: даже битый файл обязан рассказать, что в нём.
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("НЕ ЧИТАЕТСЯ: «{}»", path);
+            println!("причина: {} (код {:?})", e, e.raw_os_error());
+            println!("проверьте: путь существует, это файл, есть права, не занят ли программой");
+            return;
+        }
+    };
+    println!("файл:            {}", path);
+    println!("размер:          {} байт", data.len());
+    if data.is_empty() {
+        println!("ЭТО ПУСТОЙ ФАЙЛ (0 байт) — читать нечего");
+        return;
     }
-    if let Ok(head) = std::fs::read(&path) {
-        if head.first() == Some(&b'A') && head.get(1) == Some(&b'u') {
-            println!("  4. первые байты «AutoCAD Binary DXF» — это бинарный DXF, нужен конвертер.");
+    let head = String::from_utf8_lossy(&data[..data.len().min(48)]).replace(['\r', '\n'], " | ");
+    println!("первые байты:    {}", head);
+    if data.starts_with(b"AutoCAD Binary DXF") {
+        println!("ЭТО БИНАРНЫЙ DXF — формат не поддержан. В AutoCAD: Save As → DXF → ASCII.");
+    }
+    if let Some(ext) = std::path::Path::new(&path).extension().and_then(|e| e.to_str()) {
+        if ext.eq_ignore_ascii_case("dwg") {
+            println!("ЭТО DWG, а не DXF. Нужно сохранить как DXF (Save As → DXF).");
+        }
+    }
+    let mut d = doc::Doc::with_capacity(1024);
+    match dxf::parse(&data, &mut d) {
+        Ok(st) => {
+            println!("DXF-версия:      {}", if d.dxf_version.is_empty() { "не задана" } else { &d.dxf_version });
+            println!("кодовая страница: {}", if d.codepage.is_empty() { "не задана" } else { &d.codepage });
+            println!("секции:          {}", if st.sections.is_empty() { "—".to_string() } else { st.sections.join(", ") });
+            println!("блоков:          {}   вставок развёрнуто: {}   без определения: {}", st.blocks, st.inserts_expanded, st.inserts_unresolved);
+            println!("сущностей всего: {}   неподдержано: {}", st.total_entities, st.skipped);
+            println!("по типам:        {}", st.summary());
+            println!("--- прочитано в модель ---");
+            println!("LINE {} · CIRCLE {} · LWPOLYLINE {} · TEXT/MTEXT {} · точек {} · слоёв {}",
+                d.segs.len(), d.circles.len(), d.polys.len(), d.texts.len(), d.xs.len(), d.layers.len());
+            if d.entity_count() == 0 {
+                println!("\nМОДЕЛЬ ПУСТА. Причины по порядку вероятности:");
+                if !st.sections.iter().any(|s| s == "ENTITIES") {
+                    println!("  • в файле нет секции ENTITIES — это не чертёж или файл обрезан");
+                }
+                if st.inserts_unresolved > 0 {
+                    println!("  • {} INSERT без определений блоков — геометрия не восстановима без BLOCKS", st.inserts_unresolved);
+                }
+                if st.total_entities == 0 {
+                    println!("  • сущностей не найдено вовсе: файл мог быть сохранён как DWG с расширением .dxf");
+                } else {
+                    println!("  • все сущности неподдержанных типов: {}", st.summary());
+                }
+            }
+        }
+        Err(e) => {
+            println!("РАЗБОР НЕ УДАЛСЯ: {}", e);
+            println!("файл не похож на ASCII DXF (возможно, бинарный формат или повреждён)");
         }
     }
 }
@@ -700,6 +735,12 @@ fn main() {
         // Двойной клик по exe: раньше печаталась подсказка и консоль мгновенно
         // закрывалась — выглядело как «exe не запускается». Теперь открывается окно.
         std::process::exit(run_default_mode());
+    }
+    // `dxfsign.exe C:\path\file.dxf` (двойной клик по файлу, ассоциация) — сразу окно
+    if !args[1].starts_with('-') && !matches!(args[1].as_str(), "inspect" | "report" | "edit" | "save" | "snapshot" | "bench" | "alloc" | "catalog" | "open" | "help") {
+        let mut a: Vec<String> = vec!["open".to_string()];
+        a.extend_from_slice(&args[1..]);
+        std::process::exit(run_open_mode(&a));
     }
     match args[1].as_str() {
         "--version" | "-V" | "version" => {
