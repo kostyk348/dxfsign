@@ -353,6 +353,7 @@ fn render_and_present() {
         ox: view_w as f64 * 0.5 - cx * scale,
         oy: view_h as f64 * 0.5 + cy * scale,
     };
+    c.ui.focus = c.focus;
     let session = &c.session;
     let _ = c.renderer.frame(&c.doc, c.cam, &mut c.ui, session, &mut c.painter);
     if c.editor.open {
@@ -554,6 +555,34 @@ fn open_path(path: &str) {
     set_flash(&msg);
 }
 
+/// Действие «ПРИНЯТЬ» — одно и то же для Enter и для кнопки мышью.
+fn submit_modal() {
+    let c = ctx();
+    match c.session.step {
+        crate::edit::Step::Editing { .. } => {
+            c.session.commit_text();
+            c.focus = 1;
+            if c.session.error != WireError::None {
+                set_flash(c.session.error.message());
+            } else {
+                set_flash("Введите номер провода (обязательно), Tab — комментарий");
+            }
+        }
+        crate::edit::Step::AwaitWire { .. } => {
+            let o = c.session.submit_wire(&mut c.doc);
+            match o {
+                Outcome::Applied => {
+                    set_flash("Принято. Ctrl+S — сохранить с версией и письмом");
+                    c.focus = 0;
+                }
+                Outcome::Rejected => set_flash(c.session.error.message()),
+                _ => {}
+            }
+        }
+        crate::edit::Step::Idle => {}
+    }
+}
+
 fn do_save() {
     let c = ctx();
     set_flash("Сохранение: версия, .txt, .eml...");
@@ -576,6 +605,71 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             let x = (lp & 0xFFFF) as i16 as i32;
             let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
             let c = ctx();
+            let mut cr = Rect::default();
+            GetClientRect(hwnd, &mut cr);
+            let (cw, ch) = (cr.right - cr.left, cr.bottom - cr.top);
+
+            // ---------- клики по форме редактора каталога (приоритет — модалка сверху)
+            if c.editor.open {
+                let n = 2usize;
+                for i in 0..n {
+                    let fr = crate::render::form_field_rect(cw, ch, n, i);
+                    if crate::render::hit(fr, x, y) {
+                        c.editor.focus = i as u8;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
+                let ar = crate::render::form_accept_rect(cw, ch, n);
+                if crate::render::hit(ar, x, y) {
+                    apply_editor();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                // клик мимо полей формы в открытом редакторе ничего не меняет
+                return 0;
+            }
+
+            // ---------- клики по модальному шагу правки
+            if c.session.is_busy() {
+                let L = crate::render::modal_layout(cw, ch);
+                if crate::render::hit(L.accept, x, y) {
+                    submit_modal();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if crate::render::hit(L.cancel, x, y) {
+                    c.session.cancel();
+                    set_flash("Правка отменена: файл не тронут");
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if crate::render::hit(L.text, x, y) {
+                    c.focus = 0;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if crate::render::hit(L.wire, x, y) {
+                    // клик по номеру провода на шаге текста = подтвердить текст и перейти дальше
+                    if matches!(c.session.step, crate::edit::Step::Editing { .. }) {
+                        c.session.commit_text();
+                    }
+                    c.focus = 1;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if crate::render::hit(L.comment, x, y) {
+                    if matches!(c.session.step, crate::edit::Step::Editing { .. }) {
+                        c.session.commit_text();
+                    }
+                    c.focus = 2;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                // клик мимо полей в модалке не должен «протекать» в выбор надписи
+                return 0;
+            }
+
             // 1) клик по левой панели — выбор записи каталога
             if x < crate::render::swiss::LEFT_W && y > crate::render::swiss::TOP_H {
                 let list_y0 = crate::render::swiss::TOP_H + crate::render::swiss::MARGIN + 32;
@@ -753,31 +847,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                 }
                 VK_RETURN => {
                     if c.session.is_busy() {
-                        // Enter: текст -> провод -> применение
-                        match c.session.step {
-                            Step::Editing { .. } => {
-                                c.session.commit_text();
-                                c.focus = 1;
-                                if c.session.error != WireError::None {
-                                    set_flash(c.session.error.message());
-                                } else {
-                                    set_flash("Введите номер провода (обязательно), Tab — комментарий");
-                                }
-                            }
-                            Step::AwaitWire { .. } => {
-                                let o = c.session.submit_wire(&mut c.doc);
-                                match o {
-                                    Outcome::Applied => {
-                                        // журнал правок документа уже обновлён
-                                        set_flash("Принято. Ctrl+S — сохранить с версией и письмом");
-                                        c.focus = 0;
-                                    }
-                                    Outcome::Rejected => set_flash(c.session.error.message()),
-                                    _ => {}
-                                }
-                            }
-                            Step::Idle => {}
-                        }
+                        submit_modal();
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 }

@@ -324,8 +324,10 @@ fn cmd_snapshot(args: &[String]) {
         session.begin(idx, &d.arena_get(d.texts[idx].s).to_vec());
         session.text.set(b"Shchit-1 / Klemmnik X1");
         session.wire.set(b"W-101");
-        session.comment.set("zamenit po zamechaniyu PTO".as_bytes());
+        session.comment.set("по замечанию ПТО: заменить автомат".as_bytes());
         session.commit_text();
+        // какое поле в фокусе — для проверки вёрстки и каретки
+        ui.focus = arg_val(args, "--focus").and_then(|v| v.parse().ok()).unwrap_or(1);
     }
     let view_w = (w as i32 - render::swiss::LEFT_W - render::swiss::RIGHT_W).max(32);
     let view_h = (h as i32 - render::swiss::TOP_H - render::swiss::STATUS_H).max(32);

@@ -320,6 +320,9 @@ pub struct UiState {
     pub zoom_pct: u32,
     /// Куда уходит письмо (спул) — строка показывается в правой панели,
     /// чтобы не было вопроса «а .eml вообще сохраняется и куда».
+    /// Какое поле модалки в фокусе (0 текст, 1 провод, 2 комментарий) — окно
+    /// выставляет перед кадром, рендер показывает рамкой и кареткой.
+    pub focus: u8,
     pub spool: [u8; 160],
     pub spool_len: usize,
     /// Результат последнего сохранения.
@@ -341,6 +344,7 @@ impl UiState {
             backend: "scalar",
             entities: 0,
             zoom_pct: 100,
+            focus: 0,
             spool: [0; 160],
             spool_len: 0,
             last: [0; 200],
@@ -397,6 +401,79 @@ impl Default for UiState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------- геометрия модалки
+
+/// Прямоугольник (x, y, w, h) в координатах кадра.
+pub type Rect = (i32, i32, i32, i32);
+
+/// Раскладка модального шага правки. ОДНА функция и для рисования, и для
+/// попадания мышью: раньше окно считало геометрию само, поэтому поля не
+/// кликались — мышью можно было только нажать Tab.
+#[derive(Clone, Copy, Debug)]
+pub struct ModalLayout {
+    pub mx: i32,
+    pub my: i32,
+    pub mw: i32,
+    pub mh: i32,
+    pub text: Rect,
+    pub wire: Rect,
+    pub comment: Rect,
+    pub accept: Rect,
+    pub cancel: Rect,
+}
+
+/// O(1). Никаких обращений к кадру — чистая арифметика от размера окна.
+/// Геометрия полей универсальной формы (редактор каталога и будущие диалоги).
+pub fn form_layout(w: i32, h: i32, count: usize) -> (i32, i32, i32, i32, i32, i32) {
+    let mw = swiss::MODAL_W.min(w - 48);
+    let mh = (swiss::MODAL_H + count as i32 * 64).min(h - 48);
+    let mx = (w - mw) / 2;
+    let my = (h - mh) / 2;
+    (mx, my, mw, mh, swiss::MARGIN, mw - swiss::MARGIN * 2)
+}
+
+/// Прямоугольник поля `i` формы. O(1).
+pub fn form_field_rect(w: i32, h: i32, count: usize, i: usize) -> Rect {
+    let (mx, my, _mw, _mh, pad, inner) = form_layout(w, h, count);
+    (mx + pad, my + pad + 78 + i as i32 * 60 + 20, inner, 46)
+}
+
+/// Кнопка «СОХРАНИТЬ» формы. O(1).
+pub fn form_accept_rect(w: i32, h: i32, count: usize) -> Rect {
+    let (mx, my, mw, mh, pad, _inner) = form_layout(w, h, count);
+    (mx + mw - pad - 240, my + mh - 64, 240, 46)
+}
+
+pub fn modal_layout(w: i32, h: i32) -> ModalLayout {
+    let mw = swiss::MODAL_W.min(w - 48);
+    let mh = swiss::MODAL_H.min(h - 48);
+    let mx = (w - mw) / 2;
+    let my = (h - mh) / 2;
+    let pad = swiss::MARGIN;
+    let fw = mw - pad * 2;
+    let f1y = my + pad + 64 + 18;
+    let f2y = f1y + 62;
+    let f3y = f2y + 62;
+    let by = my + mh - 60;
+    let bw = 200;
+    ModalLayout {
+        mx,
+        my,
+        mw,
+        mh,
+        text: (mx + pad, f1y, fw, 48),
+        wire: (mx + pad, f2y, fw / 2 - 10, 48),
+        comment: (mx + pad, f3y, fw, 48),
+        accept: (mx + mw - pad - bw, by, bw, 46),
+        cancel: (mx + mw - pad - bw * 2 - swiss::GUTTER, by, bw, 46),
+    }
+}
+
+#[inline]
+pub fn hit(rect: Rect, x: i32, y: i32) -> bool {
+    x >= rect.0 && x <= rect.0 + rect.2 && y >= rect.1 && y <= rect.1 + rect.3
 }
 
 // ---------------------------------------------------------------- кадр целиком
@@ -629,101 +706,100 @@ impl Renderer {
 
         // --- модальный запрос номера провода и комментария
         if session.is_busy() {
-            self.draw_modal(session, tp);
+            let focus = ui.focus;
+            self.draw_modal(session, tp, focus);
         }
         Ok(())
     }
 
-    fn draw_modal(&mut self, session: &EditSession, tp: &mut dyn TextPainter) {
+    fn draw_modal(&mut self, session: &EditSession, tp: &mut dyn TextPainter, focus: u8) {
         let w = self.fb.w as i32;
         let h = self.fb.h as i32;
-        // Затемнение сцены: смешение всех пикселей к туши (25%), без полупрозрачности,
-        // без сетки. Сетка 2×2 давала муар и делала чертёж нечитаемым — это был
-        // реальный дефект кадра, пойманный на снимке.
+        let L = modal_layout(w, h);
+        // затемнение сцены смешением к туши (25%), без сетки: сетка давала муар
         for p in self.fb.px.iter_mut() {
             let r = (*p >> 16) & 0xFF;
             let g = (*p >> 8) & 0xFF;
             let b = *p & 0xFF;
-            let ir = (r * 3 + 0x11) / 4;
-            let ig = (g * 3 + 0x11) / 4;
-            let ib = (b * 3 + 0x11) / 4;
-            *p = (ir << 16) | (ig << 8) | ib;
+            *p = (((r * 3 + 0x11) / 4) << 16) | (((g * 3 + 0x11) / 4) << 8) | ((b * 3 + 0x11) / 4);
         }
-        let _ = (w, h);
-        let mw = swiss::MODAL_W.min(w - 48);
-        let mh = swiss::MODAL_H.min(h - 48);
-        let mx = (w - mw) / 2;
-        let my = (h - mh) / 2;
-        self.fb.fill_rect(mx + 8, my + 8, mw, mh, swiss::INK); // жёсткая тень: смещена, не размыта
-        self.fb.fill_rect(mx, my, mw, mh, swiss::WHITE);
-        self.fb.stroke_rect(mx, my, mw, mh, swiss::RULE_W, swiss::INK);
-        self.fb.fill_rect(mx, my, mw, 4, swiss::ACCENT);
+        self.fb.fill_rect(L.mx + 10, L.my + 10, L.mw, L.mh, swiss::INK); // жёсткая тень
+        self.fb.fill_rect(L.mx, L.my, L.mw, L.mh, swiss::WHITE);
+        self.fb.stroke_rect(L.mx, L.my, L.mw, L.mh, swiss::RULE_W, swiss::INK);
+        self.fb.fill_rect(L.mx, L.my, L.mw, 5, swiss::ACCENT);
 
         let pad = swiss::MARGIN;
-        tp.text(&mut self.fb, mx + pad, my + pad, swiss::T_TITLE, true, swiss::INK, "СОХРАНЕНИЕ ПРАВКИ");
+        tp.text(&mut self.fb, L.mx + pad, L.my + pad, swiss::T_TITLE, true, swiss::INK, "СОХРАНЕНИЕ ПРАВКИ");
         let sub = match session.step {
-            Step::Editing { .. } => "Шаг 1 из 2 — текст надписи",
+            Step::Editing { .. } => "Шаг 1 из 2 — текст надписи · Tab или клик: следующее поле",
             Step::AwaitWire { .. } => "Шаг 2 из 2 — номер провода обязателен",
             Step::Idle => "",
         };
-        tp.text(&mut self.fb, mx + pad, my + pad + 36, swiss::T_CAPTION, false, swiss::MUTED, sub);
+        tp.text(&mut self.fb, L.mx + pad, L.my + pad + 44, swiss::T_CAPTION, false, swiss::MUTED, sub);
 
-        // поле 1: редактируемый текст надписи
-        let mut fy = my + pad + 64;
-        tp.text(&mut self.fb, mx + pad, fy, swiss::T_CAPTION, true, swiss::MUTED, "ТЕКСТ");
-        fy += 16;
-        let fw = mw - pad * 2;
-        self.fb.stroke_rect(mx + pad, fy, fw, 40, swiss::RULE_W, swiss::INK);
+        // поле 1: текст надписи
+        tp.text(&mut self.fb, L.text.0, L.text.1 - 22, swiss::T_CAPTION, true, swiss::MUTED, "ТЕКСТ");
         let editing_text = matches!(session.step, Step::Editing { .. });
+        let tborder = if editing_text && focus == 0 { swiss::INK } else if editing_text { swiss::MUTED } else { swiss::RULE };
+        self.fb.stroke_rect(L.text.0, L.text.1, L.text.2, L.text.3, swiss::RULE_W, tborder);
         let tstr = String::from_utf8_lossy(session.text.as_bytes());
-        let tw = tp.measure(swiss::T_LABEL, false, &tstr);
-        tp.text(&mut self.fb, mx + pad + 10, fy + 11, swiss::T_LABEL, false, swiss::INK, &tstr);
-        if editing_text {
-            // каретка: сплошная полоса 2 px, мигание — забота вызывающего (кадр детерминирован)
-            let caret_x = mx + pad + 10 + (tw * session.text.caret as i32 / tstr.len().max(1) as i32);
-            self.fb.fill_rect(caret_x, fy + 8, 2, 24, swiss::ACCENT);
+        tp.text(&mut self.fb, L.text.0 + 12, L.text.1 + 13, swiss::T_LABEL, false, swiss::INK, &tstr);
+        if editing_text && focus == 0 {
+            let tw = tp.measure(swiss::T_LABEL, false, &tstr);
+            let frac = if tstr.is_empty() { 0 } else { session.text.caret.min(tstr.len()) };
+            let cx = L.text.0 + 12 + (tw * frac as i32 / tstr.len().max(1) as i32);
+            self.fb.fill_rect(cx, L.text.1 + 10, 3, 28, swiss::ACCENT);
         }
 
         // поле 2: номер провода
-        fy += 56;
-        tp.text(&mut self.fb, mx + pad, fy, swiss::T_CAPTION, true, swiss::MUTED, "НОМЕР ПРОВОДА *");
-        fy += 16;
-        let wire_err = session.error.message();
-        let border = if session.error == crate::edit::WireError::None { swiss::INK } else { swiss::ERROR };
-        self.fb.stroke_rect(mx + pad, fy, fw / 2 - 8, 40, swiss::RULE_W, border);
+        tp.text(&mut self.fb, L.wire.0, L.wire.1 - 22, swiss::T_CAPTION, true, swiss::MUTED, "НОМЕР ПРОВОДА *");
+        let wfocused = matches!(session.step, Step::AwaitWire { .. }) && focus == 1;
+        let wborder = if session.error != crate::edit::WireError::None {
+            swiss::ERROR
+        } else if wfocused {
+            swiss::INK
+        } else if matches!(session.step, Step::AwaitWire { .. }) {
+            swiss::MUTED
+        } else {
+            swiss::RULE
+        };
+        self.fb.stroke_rect(L.wire.0, L.wire.1, L.wire.2, L.wire.3, swiss::RULE_W, wborder);
         let wstr = String::from_utf8_lossy(session.wire.as_bytes());
-        tp.text(&mut self.fb, mx + pad + 10, fy + 11, swiss::T_LABEL, true, swiss::INK, &wstr);
-        if matches!(session.step, Step::AwaitWire { .. }) {
+        tp.text(&mut self.fb, L.wire.0 + 12, L.wire.1 + 13, swiss::T_LABEL, true, swiss::INK, &wstr);
+        if wfocused {
             let ww = tp.measure(swiss::T_LABEL, true, &wstr);
-            self.fb.fill_rect(mx + pad + 10 + ww + 1, fy + 8, 2, 24, swiss::ACCENT);
+            self.fb.fill_rect(L.wire.0 + 14 + ww, L.wire.1 + 10, 3, 28, swiss::ACCENT);
         }
-        if !wire_err.is_empty() {
-            tp.text(&mut self.fb, mx + pad + fw / 2, fy + 11, swiss::T_CAPTION, true, swiss::ERROR, wire_err);
+        let err = session.error.message();
+        if !err.is_empty() {
+            tp.text(&mut self.fb, L.wire.0 + L.wire.2 + 16, L.wire.1 + 13, swiss::T_CAPTION, true, swiss::ERROR, err);
         }
 
-        // поле 3: свободный комментарий
-        fy += 56;
-        tp.text(&mut self.fb, mx + pad, fy, swiss::T_CAPTION, true, swiss::MUTED, "КОММЕНТАРИЙ (свободный)");
-        fy += 16;
-        self.fb.stroke_rect(mx + pad, fy, fw, 40, swiss::RULE_W, swiss::RULE);
-        let cstr = String::from_utf8_lossy(session.comment.as_bytes());
-        tp.text(&mut self.fb, mx + pad + 10, fy + 11, swiss::T_BODY, false, swiss::INK, &cstr);
-
-        // кнопки: две жёсткие плашки, без радиусов и теней
-        let by = my + mh - 56;
-        let bw = 160;
-        self.fb.fill_rect(mx + mw - pad - bw, by, bw, 40, swiss::INK);
-        tp.text(&mut self.fb, mx + mw - pad - bw + 24, by + 11, swiss::T_LABEL, true, swiss::PAPER, "ПРИНЯТЬ  Enter");
-        self.fb.stroke_rect(mx + mw - pad - bw * 2 - swiss::GUTTER, by, bw, 40, swiss::RULE_W, swiss::INK);
-        tp.text(
-            &mut self.fb,
-            mx + mw - pad - bw * 2 - swiss::GUTTER + 24,
-            by + 11,
-            swiss::T_LABEL,
-            false,
-            swiss::INK,
-            "ОТМЕНА  Esc",
+        // поле 3: свободный комментарий — фокус виден рамкой и кареткой,
+        // иначе «кликнул, а непонятно, попал ли»
+        let cfocused = focus == 2;
+        let clabel = if cfocused { "КОММЕНТАРИЙ (свободный) — ввод" } else { "КОММЕНТАРИЙ (свободный)" };
+        tp.text(&mut self.fb, L.comment.0, L.comment.1 - 22, swiss::T_CAPTION, true, swiss::MUTED, clabel);
+        self.fb.stroke_rect(
+            L.comment.0,
+            L.comment.1,
+            L.comment.2,
+            L.comment.3,
+            swiss::RULE_W,
+            if cfocused { swiss::INK } else { swiss::RULE },
         );
+        let cstr = String::from_utf8_lossy(session.comment.as_bytes());
+        tp.text(&mut self.fb, L.comment.0 + 12, L.comment.1 + 13, swiss::T_BODY, false, swiss::INK, &cstr);
+        if cfocused {
+            let cw = tp.measure(swiss::T_BODY, false, &cstr);
+            self.fb.fill_rect(L.comment.0 + 14 + cw, L.comment.1 + 10, 3, 28, swiss::ACCENT);
+        }
+
+        // кнопки
+        self.fb.fill_rect(L.accept.0, L.accept.1, L.accept.2, L.accept.3, swiss::INK);
+        tp.text(&mut self.fb, L.accept.0 + 24, L.accept.1 + 12, swiss::T_LABEL, true, swiss::PAPER, "ПРИНЯТЬ  Enter");
+        self.fb.stroke_rect(L.cancel.0, L.cancel.1, L.cancel.2, L.cancel.3, swiss::RULE_W, swiss::INK);
+        tp.text(&mut self.fb, L.cancel.0 + 24, L.cancel.1 + 12, swiss::T_LABEL, false, swiss::INK, "ОТМЕНА  Esc");
     }
 
     /// Универсальная форма-модалка: заголовок, подпись, поля «метка: значение»
@@ -745,10 +821,7 @@ impl Renderer {
             let b = *p & 0xFF;
             *p = (((r * 3 + 0x11) / 4) << 16) | (((g * 3 + 0x11) / 4) << 8) | ((b * 3 + 0x11) / 4);
         }
-        let mw = swiss::MODAL_W.min(w - 48);
-        let mh = (swiss::MODAL_H + (fields.len() as i32) * 64).min(h - 48);
-        let mx = (w - mw) / 2;
-        let my = (h - mh) / 2;
+        let (mx, my, mw, mh, _pad, _inner) = form_layout(w, h, fields.len());
         self.fb.fill_rect(mx + 10, my + 10, mw, mh, swiss::INK);
         self.fb.fill_rect(mx, my, mw, mh, swiss::WHITE);
         self.fb.stroke_rect(mx, my, mw, mh, swiss::RULE_W, swiss::INK);
@@ -757,18 +830,16 @@ impl Renderer {
         tp.text(&mut self.fb, mx + pad, my + pad, swiss::T_TITLE, true, swiss::INK, title);
         tp.text(&mut self.fb, mx + pad, my + pad + 42, swiss::T_CAPTION, false, swiss::MUTED, subtitle);
         let mut fy = my + pad + 78;
-        for (label, value, focused) in fields {
-            tp.text(&mut self.fb, mx + pad, fy, swiss::T_CAPTION, true, swiss::MUTED, label);
-            fy += 20;
+        for (i, (label, value, focused)) in fields.iter().enumerate() {
+            let fr = form_field_rect(w, h, fields.len(), i);
+            tp.text(&mut self.fb, fr.0, fr.1 - 20, swiss::T_CAPTION, true, swiss::MUTED, label);
             let color = if *focused { swiss::INK } else { swiss::RULE };
-            self.fb.stroke_rect(mx + pad, fy, mw - pad * 2, 46, swiss::RULE_W, color);
-            tp.text(&mut self.fb, mx + pad + 12, fy + 12, swiss::T_LABEL, false, swiss::INK, value);
+            self.fb.stroke_rect(fr.0, fr.1, fr.2, fr.3, swiss::RULE_W, color);
+            tp.text(&mut self.fb, fr.0 + 12, fr.1 + 12, swiss::T_LABEL, false, swiss::INK, value);
             if *focused {
-                let mut m = swiss::T_LABEL;
-                m = tp.measure(swiss::T_LABEL, false, value);
-                self.fb.fill_rect(mx + pad + 14 + m, fy + 10, 3, 26, swiss::ACCENT);
+                let m = tp.measure(swiss::T_LABEL, false, value);
+                self.fb.fill_rect(fr.0 + 14 + m, fr.1 + 10, 3, 26, swiss::ACCENT);
             }
-            fy += 60;
         }
         let by = my + mh - 64;
         tp.text(&mut self.fb, mx + pad, by + 14, swiss::T_CAPTION, false, swiss::MUTED, hint);
@@ -965,6 +1036,45 @@ mod tests {
         r.snapshot_bmp(&mut bmp);
         assert_eq!(&bmp[0..2], b"BM");
         assert!(bmp.len() > 1280 * 720 * 3);
+    }
+
+    #[test]
+    fn modal_fields_are_clickable_and_do_not_overlap() {
+        // Окно и рендер считают геометрию одной функцией — проверяем, что поля
+        // не наезжают друг на друга и на кнопки, и что каждое внутри модалки.
+        for (w, h) in [(1600, 1000), (1280, 800), (900, 640)] {
+            let L = modal_layout(w, h);
+            let all = [L.text, L.wire, L.comment, L.accept, L.cancel];
+            for (i, a) in all.iter().enumerate() {
+                // поле целиком внутри окна модалки
+                assert!(a.0 >= L.mx && a.1 >= L.my, "поле {} вышло за левый/верхний край", i);
+                assert!(a.0 + a.2 <= L.mx + L.mw, "поле {} вышло вправо", i);
+                assert!(a.1 + a.3 <= L.my + L.mh, "поле {} вышло вниз", i);
+                // центр поля обязан попадать в само поле — иначе клик не сработает
+                let cx = a.0 + a.2 / 2;
+                let cy = a.1 + a.3 / 2;
+                assert!(hit(*a, cx, cy), "центр поля {} не попадает в него", i);
+                for (j, b) in all.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    let overlap = a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
+                    assert!(!overlap, "поля {} и {} пересекаются при {}×{}", i, j, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn form_fields_follow_layout() {
+        let (w, h) = (1600, 1000);
+        let f0 = form_field_rect(w, h, 2, 0);
+        let f1 = form_field_rect(w, h, 2, 1);
+        assert!(f1.1 > f0.1, "второе поле ниже первого");
+        assert_eq!(f1.1 - f0.1, 60);
+        let acc = form_accept_rect(w, h, 2);
+        assert!(hit(acc, acc.0 + 10, acc.1 + 10));
+        assert!(acc.1 > f1.1 + f1.3, "кнопка ниже полей");
     }
 
     #[test]
