@@ -429,6 +429,9 @@ fn cmd_snapshot(args: &[String]) {
     let w: usize = arg_val(args, "--w").and_then(|v| v.parse().ok()).unwrap_or(1440);
     let h: usize = arg_val(args, "--h").and_then(|v| v.parse().ok()).unwrap_or(900);
     let (d, _) = load_doc(&path);
+    // --zoom-text N: тот же расчёт, что делает окно при выборе надписи —
+    // нужен, чтобы проверять читаемость глазами и в тестах.
+    let zoom_idx = arg_val(args, "--zoom-text").and_then(|v| v.parse::<usize>().ok());
     let mut r = render::Renderer::new(w, h, d.xs.len().max(16) * 2);
     let mut ui = render::UiState::new();
     ui.set_file(path.rsplit(['\\', '/']).next().unwrap_or(&path));
@@ -466,9 +469,21 @@ fn cmd_snapshot(args: &[String]) {
         // какое поле в фокусе — для проверки вёрстки и каретки
         ui.focus = arg_val(args, "--focus").and_then(|v| v.parse().ok()).unwrap_or(1);
     }
-    let view_w = (w as i32 - render::swiss::LEFT_W - render::swiss::RIGHT_W).max(32);
+    let view_w = (w as i32 - render::swiss::left_w() - render::swiss::right_w()).max(32);
     let view_h = (h as i32 - render::swiss::TOP_H - render::swiss::STATUS_H).max(32);
-    let cam = render::Camera::fit(d.bounds(), view_w, view_h, 64);
+    let cam = if let Some(zi) = zoom_idx {
+        let t = &d.texts[zi.min(d.texts.len().saturating_sub(1))];
+        let (tx, ty) = d.point(t.pos);
+        let th = if t.height > 0.01 { t.height } else { 2.5 };
+        let scale = (22.0 / th).clamp(0.001, 5_000.0);
+        render::Camera {
+            scale,
+            ox: view_w as f64 * 0.5 - tx * scale,
+            oy: view_h as f64 * 0.5 + ty * scale,
+        }
+    } else {
+        render::Camera::fit(d.bounds(), view_w, view_h, 64)
+    };
     let mut painter = win32::GdiPainter::new();
     match painter.as_mut() {
         Some(p) => {
@@ -540,7 +555,7 @@ fn cmd_frame_bench(args: &[String]) {
     let mut ui = render::UiState::new();
     ui.set_file(&path);
     ui.set_status("frame-bench");
-    let view_w = 1600 - render::swiss::LEFT_W - render::swiss::RIGHT_W;
+    let view_w = 1600 - render::swiss::left_w() - render::swiss::right_w();
     let view_h = 1000 - render::swiss::TOP_H - render::swiss::STATUS_H;
     let cam = render::Camera::fit(d.bounds(), view_w, view_h, 64);
     let session = edit::EditSession::new();
@@ -570,7 +585,7 @@ fn cmd_alloc(args: &[String]) {
     ui.set_file("bench.dxf");
     ui.set_status("проверка аллокаций");
     ui.catalog_names.push("ИТП-3".to_string());
-    let view_w = 1280 - render::swiss::LEFT_W - render::swiss::RIGHT_W;
+    let view_w = 1280 - render::swiss::left_w() - render::swiss::right_w();
     let view_h = 800 - render::swiss::TOP_H - render::swiss::STATUS_H;
     let cam = render::Camera::fit(d.bounds(), view_w, view_h, 64);
     let session = edit::EditSession::new();
@@ -912,8 +927,91 @@ fn run_open_mode(_args: &[String]) -> i32 {
     usage()
 }
 
+/// Журнал запуска: версия, ОС, аргументы. Нужен именно для случая «на другом
+/// компьютере не грузит» — по нему видно, дошло ли дело до окна и на чём встало.
+pub fn startup_log(msg: &str) {
+    use std::io::Write;
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    let dir = format!("{}/dxfsign", base);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{}/startup.log", dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{}  v{}  {}", unix_secs_min(), VERSION, msg);
+        let _ = f.flush();
+    }
+}
+
+/// Время для журнала: секунды без внешних зависимостей.
+fn unix_secs_min() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Версия Windows (для журнала): на Win7 и Win11 подсказки разные.
+fn os_version() -> String {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct OsVersionInfoW {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            csd: [u16; 128],
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn RtlGetVersion(v: *mut OsVersionInfoW) -> i32;
+        }
+        let mut v = OsVersionInfoW {
+            size: std::mem::size_of::<OsVersionInfoW>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        unsafe { RtlGetVersion(&mut v) };
+        format!("Windows {}.{} build {}", v.major, v.minor, v.build)
+    }
+    #[cfg(not(windows))]
+    {
+        "non-windows".to_string()
+    }
+}
+
+/// Перехват падений. Без этого на Windows без консоли приложение просто
+/// исчезает, и причину узнать неоткуда — именно так выглядело «не грузит».
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let text = format!("ПАДЕНИЕ: {}", info);
+        startup_log(&text);
+        #[cfg(windows)]
+        {
+            #[link(name = "user32")]
+            extern "system" {
+                fn MessageBoxA(hwnd: isize, text: *const u8, caption: *const u8, flags: u32) -> i32;
+            }
+            let mut msg: Vec<u8> = text.as_bytes().to_vec();
+            msg.push(0);
+            let caption = b"dxfsign: error\0";
+            unsafe { MessageBoxA(0, msg.as_ptr(), caption.as_ptr(), 0x10) };
+        }
+    }));
+}
+
 fn main() {
+    install_panic_hook();
+    // Диагностика на старых процессорах читается один раз: в кадре только атомик.
+    render::set_force_scalar(std::env::var_os("DXFSIGN_SCALAR").is_some());
     let args: Vec<String> = std::env::args().collect();
+    startup_log(&format!("старт: {} | cwd {:?} | аргументы {:?}",
+        os_version(),
+        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+        &args[1..]));
     if args.len() < 2 {
         // Двойной клик по exe: раньше печаталась подсказка и консоль мгновенно
         // закрывалась — выглядело как «exe не запускается». Теперь открывается окно.

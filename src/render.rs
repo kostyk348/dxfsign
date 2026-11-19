@@ -54,6 +54,39 @@ pub mod swiss {
     pub const STATUS_H: i32 = 44;
     pub const LEFT_W: i32 = 340;
     pub const RIGHT_W: i32 = 400;
+
+    /// Ширина кадра, под которую сейчас считается раскладка. Одна на рендер и на
+    /// попадание мышью: раньше при маленьком экране панели съедали канву, и
+    /// чертёж выглядел «незагруженным».
+    static LAYOUT_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1440);
+
+    pub fn set_layout_width(w: i32) {
+        LAYOUT_W.store(w.max(320), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn layout_w() -> i32 {
+        LAYOUT_W.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Левая панель: на узком окне уже, но не меньше 190 px (иначе имена не читаются).
+    pub fn left_w() -> i32 {
+        let w = layout_w();
+        if w < 1180 {
+            (w * 22 / 100).clamp(190, LEFT_W)
+        } else {
+            LEFT_W
+        }
+    }
+
+    /// Правая панель: на узком окне уже; скрывать нельзя — там номер провода и спул.
+    pub fn right_w() -> i32 {
+        let w = layout_w();
+        if w < 1180 {
+            (w * 24 / 100).clamp(200, RIGHT_W)
+        } else {
+            RIGHT_W
+        }
+    }
     pub const MODAL_W: i32 = 760;
     pub const MODAL_H: i32 = 470;
     pub const ROW_H: i32 = 32;
@@ -370,6 +403,21 @@ pub unsafe fn project_avx2(
     }
 }
 
+/// Принудительно скалярный путь (`DXFSIGN_SCALAR=1`). Нужен для диагностики на
+/// старых машинах: если со скаляром работает, а без него нет — виноват SIMD.
+/// Флаг читается один раз в `main`, в кадре только атомик: чтение окружения
+/// аллоцирует, а кадр обязан не аллоцировать.
+static FORCE_SCALAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_force_scalar(v: bool) {
+    FORCE_SCALAR.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn force_scalar() -> bool {
+    FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Диспетчеризация: AVX2, если он есть у процессора, иначе скаляр.
 /// O(N). Возвращает выбранный путь — это пишется в статусную строку, чтобы
 /// человек видел, на чём именно считает машина (и на Win7 не удивлялся).
@@ -382,7 +430,7 @@ pub fn project(
 ) -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
+        if !force_scalar() && std::is_x86_feature_detected!("avx2") {
             unsafe { project_avx2(xs, ys, cam, sx, sy) };
             return "avx2";
         }
@@ -624,13 +672,13 @@ pub fn toolbar_rect(i: usize) -> Rect {
 pub fn left_row_rect(i: usize) -> Rect {
     let x = 0;
     let y = swiss::TOP_H + swiss::MARGIN + 26 + i as i32 * swiss::ROW_H;
-    (x, y, swiss::LEFT_W - swiss::RULE_W, swiss::ROW_H)
+    (x, y, swiss::left_w() - swiss::RULE_W, swiss::ROW_H)
 }
 
 /// Строка списка надписей `i` при заданной высоте блока каталога. O(1).
 pub fn left_text_row_rect(cat_bottom: i32, i: usize) -> Rect {
     let y = cat_bottom + 40 + i as i32 * swiss::ROW_H;
-    (0, y, swiss::LEFT_W - swiss::RULE_W, swiss::ROW_H)
+    (0, y, swiss::left_w() - swiss::RULE_W, swiss::ROW_H)
 }
 
 /// Низ блока каталога в левой панели — по нему окно понимает, где начинается
@@ -687,10 +735,12 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let w = self.fb.w as i32;
         let h = self.fb.h as i32;
+        // Раскладка (а значит и попадание мышью) считается от фактической ширины.
+        swiss::set_layout_width(w);
         if doc.xs.len() > self.points_cap {
             return Err(RenderError::Overflow { need: doc.xs.len(), have: self.points_cap });
         }
-        let (vw0, vh0) = (w - swiss::LEFT_W - swiss::RIGHT_W, h - swiss::TOP_H - swiss::STATUS_H);
+        let (vw0, vh0) = (w - swiss::left_w() - swiss::right_w(), h - swiss::TOP_H - swiss::STATUS_H);
         let frame_t0 = std::time::Instant::now();
         let vx = swiss::LEFT_W;
         let vy = swiss::TOP_H;
@@ -713,7 +763,7 @@ impl Renderer {
         let (cx0, cy0, cx1, cy1) = (vx - 8, vy - 8, vx + vw0 + 8, vy + vh0 + 8);
         let on_screen = |x: i32, y: i32| -> bool { x >= cx0 && x <= cx1 && y >= cy0 && y <= cy1 };
         let step = self.seg_step.max(1);
-        let canvas = (0, swiss::TOP_H, w - swiss::RIGHT_W - 1, h - swiss::STATUS_H - 1);
+        let canvas = (0, swiss::TOP_H, w - swiss::right_w() - 1, h - swiss::STATUS_H - 1);
         for s in doc.segs.iter().step_by(step) {
             let (i, j) = (s.a as usize, s.b as usize);
             self.fb.line_clipped(vx + self.sx[i], vy + self.sy[i], vx + self.sx[j], vy + self.sy[j], swiss::INK, canvas);
@@ -855,13 +905,13 @@ impl Renderer {
 
         // --- левая панель: каталог сетевого диска + список надписей чертежа
         let lh = h - swiss::TOP_H - swiss::STATUS_H;
-        self.fb.fill_rect(0, swiss::TOP_H, swiss::LEFT_W, lh, swiss::WHITE);
-        self.fb.fill_rect(swiss::LEFT_W - swiss::RULE_W, swiss::TOP_H, swiss::RULE_W, lh, swiss::INK);
+        self.fb.fill_rect(0, swiss::TOP_H, swiss::left_w(), lh, swiss::WHITE);
+        self.fb.fill_rect(swiss::left_w() - swiss::RULE_W, swiss::TOP_H, swiss::RULE_W, lh, swiss::INK);
         let pad = swiss::MARGIN;
         // --- каталог (верхняя треть) на подложке, чтобы блоки панели различались
         let cat_rows_n = ui.catalog_names.len().min(6);
         let cat_block_h = swiss::MARGIN + 26 + cat_rows_n as i32 * swiss::ROW_H + 14;
-        self.fb.fill_rect(0, swiss::TOP_H, swiss::LEFT_W - swiss::RULE_W, cat_block_h, swiss::CANVAS);
+        self.fb.fill_rect(0, swiss::TOP_H, swiss::left_w() - swiss::RULE_W, cat_block_h, swiss::CANVAS);
         tp.text(&mut self.fb, pad, swiss::TOP_H + pad, swiss::T_CAPTION, true, swiss::MUTED, "КАТАЛОГ СЕТЕВОГО ДИСКА");
         let list_y0 = swiss::TOP_H + pad + 26;
         let cat_rows = ui.catalog_names.len().min(6);
@@ -885,8 +935,8 @@ impl Renderer {
         let cat_bottom = list_y0 + cat_rows as i32 * swiss::ROW_H;
 
         // --- список надписей (ниже каталога) — главный инструмент: правят текст
-        self.fb.fill_rect(0, cat_bottom, swiss::LEFT_W - swiss::RULE_W, swiss::RULE_W * 2, swiss::INK);
-        self.fb.fill_rect(0, cat_bottom + swiss::RULE_W * 2, swiss::LEFT_W - swiss::RULE_W, 10, swiss::WHITE);
+        self.fb.fill_rect(0, cat_bottom, swiss::left_w() - swiss::RULE_W, swiss::RULE_W * 2, swiss::INK);
+        self.fb.fill_rect(0, cat_bottom + swiss::RULE_W * 2, swiss::left_w() - swiss::RULE_W, 10, swiss::WHITE);
         let hdr = swiss::TOP_H + cat_bottom - swiss::TOP_H + 12;
         let mut hb = [0u8; 48];
         let hdr = concat_u32(&mut hb, doc.texts.len() as u32, " НАДПИСЕЙ · клик = выбор");
@@ -931,16 +981,16 @@ impl Renderer {
             let max_scroll = doc.texts.len().saturating_sub(rows).max(1) as f32;
             let pos = (ui.texts_scroll as f32 / max_scroll).clamp(0.0, 1.0);
             let ty = rows_y0 + ((track_h - thumb_h) as f32 * pos) as i32;
-            self.fb.fill_rect(swiss::LEFT_W - 12, ty, 6, thumb_h, swiss::MUTED);
+            self.fb.fill_rect(swiss::left_w() - 12, ty, 6, thumb_h, swiss::MUTED);
         }
 
         // --- правая панель: свойства выбранной надписи
         // Раскладка с обрезкой по метрике шрифта: раньше длинная подсказка выезжала
         // за край панели и обрезалась пикселями — это и был «кривой UI».
-        let rx = w - swiss::RIGHT_W;
+        let rx = w - swiss::right_w();
         let pad = swiss::MARGIN;
-        let inner = swiss::RIGHT_W - pad * 2;
-        self.fb.fill_rect(rx, swiss::TOP_H, swiss::RIGHT_W, lh, swiss::WHITE);
+        let inner = swiss::right_w() - pad * 2;
+        self.fb.fill_rect(rx, swiss::TOP_H, swiss::right_w(), lh, swiss::WHITE);
         self.fb.fill_rect(rx, swiss::TOP_H, swiss::RULE_W, lh, swiss::INK);
         tp.text(&mut self.fb, rx + pad, swiss::TOP_H + pad, swiss::T_CAPTION, true, swiss::MUTED, "НАДПИСЬ");
         let mut ly = swiss::TOP_H + pad + 26;
@@ -961,7 +1011,7 @@ impl Renderer {
                 let hs = concat_u32(&mut nb, t.height as u32, " ед.");
                 tp.text(&mut self.fb, rx + pad, ly, swiss::T_BODY, false, swiss::MUTED, "высота");
                 let hw = tp.measure(swiss::T_BODY, true, hs);
-                tp.text(&mut self.fb, rx + swiss::RIGHT_W - pad - hw, ly, swiss::T_BODY, true, swiss::INK, hs);
+                tp.text(&mut self.fb, rx + swiss::right_w() - pad - hw, ly, swiss::T_BODY, true, swiss::INK, hs);
                 ly += 32;
 
                 let wire = String::from_utf8_lossy(doc.arena_get(t.wire));
@@ -969,7 +1019,7 @@ impl Renderer {
                 let wstr: &str = if wire.is_empty() { "не задан" } else { &wire };
                 let wcol = if wire.is_empty() { swiss::MUTED } else { swiss::ACCENT };
                 let ww = tp.measure(swiss::T_BODY, true, wstr);
-                tp.text(&mut self.fb, rx + swiss::RIGHT_W - pad - ww, ly, swiss::T_BODY, true, wcol, wstr);
+                tp.text(&mut self.fb, rx + swiss::right_w() - pad - ww, ly, swiss::T_BODY, true, wcol, wstr);
                 ly += 36;
 
                 self.fb.fill_rect(rx + pad, ly, inner, swiss::RULE_W, swiss::RULE);

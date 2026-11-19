@@ -137,6 +137,7 @@ extern "system" {
     fn GetClientRect(hwnd: Hwnd, r: *mut Rect) -> i32;
     fn InvalidateRect(hwnd: Hwnd, r: *const Rect, erase: i32) -> i32;
     fn SetTimer(hwnd: Hwnd, id: usize, ms: u32, proc: *const c_void) -> usize;
+    fn SystemParametersInfoA(action: u32, param: u32, data: *mut c_void, win_ini: u32) -> i32;
     fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
     fn GetKeyState(vk: i32) -> i16;
     fn SetProcessDPIAware() -> i32;
@@ -371,7 +372,7 @@ fn render_and_present() {
     let w = (r.right - r.left).max(320);
     let h = (r.bottom - r.top).max(240);
     c.renderer.fb.resize(w as usize, h as usize);
-    let view_w = (w - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+    let view_w = (w - crate::render::swiss::left_w() - crate::render::swiss::right_w()).max(32);
     let view_h = (h - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
     if c.zoom <= 0.0 {
         let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
@@ -446,7 +447,7 @@ fn render_and_present() {
 /// размер — из высоты текста и метрики шрифта. O(T) по надписям.
 fn hit_test_text(mx: i32, my: i32) -> Option<usize> {
     let c = ctx();
-    let vx = crate::render::swiss::LEFT_W;
+    let vx = crate::render::swiss::left_w();
     let vy = crate::render::swiss::TOP_H;
     let mut best: Option<(usize, i32)> = None;
     for (i, t) in c.doc.texts.iter().enumerate() {
@@ -543,7 +544,7 @@ fn run_tool(code: u8) {
 
 fn fit_view() {
     let c = ctx();
-    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::left_w() - crate::render::swiss::right_w()).max(32);
     let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
     let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
     c.zoom = fit.scale;
@@ -556,9 +557,9 @@ fn fit_view() {
 /// O(1). Иначе зум «прыгает» и человек теряет место, где работал.
 fn zoom_at(screen_x: i32, screen_y: i32, factor: f64) {
     let c = ctx();
-    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::left_w() - crate::render::swiss::right_w()).max(32);
     let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
-    let lx = (screen_x - crate::render::swiss::LEFT_W) as f64;
+    let lx = (screen_x - crate::render::swiss::left_w()) as f64;
     let ly = (screen_y - crate::render::swiss::TOP_H) as f64;
     let s = c.zoom.max(1e-9);
     // мировая точка под курсором до зума
@@ -672,7 +673,8 @@ fn open_path(path: &str) {
                 return;
             }
         }
-        let (prog, rx) = crate::loader::spawn(path.to_string());
+        crate::startup_log(&format!("открываю: {}", path));
+    let (prog, rx) = crate::loader::spawn(path.to_string());
         c.pending = Some(PendingLoad {
             prog,
             rx,
@@ -684,6 +686,30 @@ fn open_path(path: &str) {
     }
     let c = ctx();
     unsafe { InvalidateRect(c.hwnd, std::ptr::null(), 0) };
+}
+
+/// Приблизить к выбранной надписи: центрирует вид и, если надпись на экране
+/// мельче 14 px, увеличивает масштаб до читаемого. Без этого на узкой канве
+/// надписи сливаются в полосу и выглядят как «ничего не загрузилось».
+fn focus_text(idx: usize) {
+    let c = ctx();
+    let Some(t) = c.doc.texts.get(idx).copied() else { return };
+    let (x, y) = c.doc.point(t.pos);
+    let h = if t.height > 0.01 { t.height } else { 2.5 };
+    let px_h = h * c.zoom;
+    if px_h < 14.0 {
+        // 22 px высоты надписи — читаемо и не «в лоб»
+        c.zoom = (22.0 / h).clamp(c.zoom, 5_000.0);
+    }
+    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::left_w() - crate::render::swiss::right_w()).max(32);
+    let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
+    c.view_center = (x, y);
+    c.cam = Camera {
+        scale: c.zoom,
+        ox: view_w as f64 * 0.5 - x * c.zoom,
+        oy: view_h as f64 * 0.5 + y * c.zoom,
+    };
+    crate::startup_log(&format!("приближено к надписи [{}]: высота {:.1} px, масштаб {:.2}", idx, h * c.zoom, c.zoom));
 }
 
 /// Установить загруженный чертёж в окно. O(1) плюс настройка первого кадра.
@@ -711,7 +737,7 @@ fn install_doc(doc: Doc, msg: String) {
     } else {
         1
     };
-    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::left_w() - crate::render::swiss::right_w()).max(32);
     let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
     let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
     c.zoom = fit.scale;
@@ -720,6 +746,13 @@ fn install_doc(doc: Doc, msg: String) {
     c.cam = fit;
     c.ui.set_last(&msg);
     set_flash(&msg);
+    crate::startup_log(&format!(
+        "чертёж установлен: объектов {}, отрезков {}, надписей {}, слоёв {}",
+        c.doc.entity_count(),
+        c.doc.segs.len(),
+        c.doc.texts.len(),
+        c.doc.layers.len()
+    ));
 }
 
 /// Число в строку без аллокаций (для экрана загрузки).
@@ -900,6 +933,7 @@ fn poll_loading(hwnd: Hwnd) {
                     }
                 }
                 Err(e) => {
+                    crate::startup_log(&format!("не открыт: {} — {}", loaded.path, e));
                     let msg = format!("Не открыт «{}»: {}", loaded.path, e);
                     c.ui.set_last(&msg);
                     set_flash(&msg);
@@ -951,8 +985,8 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                 return 0;
             }
             // подсветка надписи под курсором — только когда курсор над канвой
-            let over_canvas = x > crate::render::swiss::LEFT_W
-                && x < (c.renderer.fb.w as i32 - crate::render::swiss::RIGHT_W)
+            let over_canvas = x > crate::render::swiss::left_w()
+                && x < (c.renderer.fb.w as i32 - crate::render::swiss::right_w())
                 && y > crate::render::swiss::TOP_H;
             let hover = if over_canvas { hit_test_text(x, y) } else { None };
             if hover != c.ui.hover_text || prev != c.ui.mouse {
@@ -1123,7 +1157,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             }
 
             // 1) левая панель: каталог сверху, список надписей ниже
-            if x < crate::render::swiss::LEFT_W && y > crate::render::swiss::TOP_H {
+            if x < crate::render::swiss::left_w() && y > crate::render::swiss::TOP_H {
                 let cat_rows = c.ui.catalog_names.len().min(6);
                 for i in 0..cat_rows {
                     if crate::render::hit(crate::render::left_row_rect(i), x, y) {
@@ -1140,6 +1174,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     let idx = c.ui.texts_scroll + row;
                     if idx < c.doc.texts.len() {
                         c.ui.selected_text = Some(idx);
+                        focus_text(idx);
                         let s = format!(
                             "Выбрана надпись [{}]: \"{}\" — F2 править",
                             idx,
@@ -1188,7 +1223,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
             let c = ctx();
             let (mx, my) = c.ui.mouse;
-            if mx >= 0 && mx < crate::render::swiss::LEFT_W && my > crate::render::swiss::TOP_H {
+            if mx >= 0 && mx < crate::render::swiss::left_w() && my > crate::render::swiss::TOP_H {
                 scroll_texts(if delta > 0 { -3 } else { 3 });
             } else {
                 let f = if delta > 0 { 1.18 } else { 1.0 / 1.18 };
@@ -1343,7 +1378,7 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     // PgUp / PgDn — масштаб вокруг центра канвы
                     let cw = c.renderer.fb.w as i32;
                     let chh = c.renderer.fb.h as i32;
-                    let mx = crate::render::swiss::LEFT_W + (cw - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W) / 2;
+                    let mx = crate::render::swiss::left_w() + (cw - crate::render::swiss::left_w() - crate::render::swiss::right_w()) / 2;
                     let my = crate::render::swiss::TOP_H + (chh - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H) / 2;
                     zoom_at(mx, my, if wp == 0x21 { 1.25 } else { 1.0 / 1.25 });
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -1356,12 +1391,12 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                 }
                 VK_ADD | VK_OEM_PLUS => {
                     let (mx, my) = c.ui.mouse;
-                    zoom_at(mx.max(crate::render::swiss::LEFT_W + 40), my.max(crate::render::swiss::TOP_H + 40), 1.25);
+                    zoom_at(mx.max(crate::render::swiss::left_w() + 40), my.max(crate::render::swiss::TOP_H + 40), 1.25);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 VK_SUBTRACT | VK_OEM_MINUS => {
                     let (mx, my) = c.ui.mouse;
-                    zoom_at(mx.max(crate::render::swiss::LEFT_W + 40), my.max(crate::render::swiss::TOP_H + 40), 1.0 / 1.25);
+                    zoom_at(mx.max(crate::render::swiss::left_w() + 40), my.max(crate::render::swiss::TOP_H + 40), 1.0 / 1.25);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 VK_F4 => {
@@ -1460,6 +1495,20 @@ pub fn run(
         // 1:1, и на 125–150% DPI системное масштабирование даёт правильный размер
         // (чуть мягче), тогда как принудительный DPI-aware делал всё мелким.
         let _ = SetProcessDPIAware;
+        // Размер окна — по рабочей области, а не вслепую 1440×900: на Win7-ноутбуке
+        // (1366×768 и меньше) окно уезжало за экран, и выглядело как «не грузит».
+        let (mut win_w, mut win_h) = (width as i32, height as i32);
+        {
+            #[repr(C)]
+            struct RectW { l: i32, t: i32, r: i32, b: i32 }
+            let mut ra = RectW { l: 0, t: 0, r: 0, b: 0 };
+            if SystemParametersInfoA(0x0030, 0, &mut ra as *mut RectW as *mut c_void, 0) != 0 {
+                let avail_w = (ra.r - ra.l) - 40;
+                let avail_h = (ra.b - ra.t) - 60;
+                win_w = win_w.min(avail_w.max(900));
+                win_h = win_h.min(avail_h.max(600));
+            }
+        }
         let hinst = GetModuleHandleA(std::ptr::null());
         let class_name = b"dxfsign_window\x00";
         let wc = WndClassA {
@@ -1490,7 +1539,7 @@ pub fn run(
         }
         ui.set_status("F2 правка · F3 комментарий · Ctrl+S сохранить · F7 вписать · Esc выход");
         let renderer = Renderer::new(width.max(640), height.max(400), doc.xs.len().max(64) * 2);
-        let view_w = (width as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+        let view_w = (width as i32 - crate::render::swiss::left_w() - crate::render::swiss::right_w()).max(32);
         let view_h = (height as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
         let cam = Camera::fit(doc.bounds(), view_w, view_h, 32);
         let painter = match GdiPainter::new() {
@@ -1541,8 +1590,8 @@ pub fn run(
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            width as i32,
-            height as i32,
+            win_w,
+            win_h,
             0,
             0,
             hinst,
@@ -1564,6 +1613,7 @@ pub fn run(
         }
         // Файл из аргумента грузим уже ПОСЛЕ появления окна: иначе на большом
         // чертеже окно не появляется вовсе, и это выглядит как «не грузит».
+        crate::startup_log(&format!("окно создано: {}x{}", win_w, win_h));
         if let Some(p) = initial_path {
             open_path(&p);
         }
