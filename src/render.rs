@@ -323,6 +323,16 @@ pub struct UiState {
     /// Какое поле модалки в фокусе (0 текст, 1 провод, 2 комментарий) — окно
     /// выставляет перед кадром, рендер показывает рамкой и кареткой.
     pub focus: u8,
+    /// Позиция мыши в координатах окна — для наведения и подсветки.
+    pub mouse: (i32, i32),
+    /// Индекс надписи под курсором (для подсветки до клика).
+    pub hover_text: Option<usize>,
+    /// Прокрутка списка надписей в левой панели (в строках).
+    pub texts_scroll: usize,
+    /// Показана ли справка по клавишам (F1).
+    pub help_open: bool,
+    /// Какая кнопка тулбара нажата (для визуального отклика).
+    pub pressed_tool: Option<usize>,
     pub spool: [u8; 160],
     pub spool_len: usize,
     /// Результат последнего сохранения.
@@ -345,6 +355,11 @@ impl UiState {
             entities: 0,
             zoom_pct: 100,
             focus: 0,
+            mouse: (-1, -1),
+            hover_text: None,
+            texts_scroll: 0,
+            help_open: false,
+            pressed_tool: None,
             spool: [0; 160],
             spool_len: 0,
             last: [0; 200],
@@ -368,6 +383,12 @@ impl UiState {
 
     pub fn file_str(&self) -> &str {
         std::str::from_utf8(&self.file_name[..self.file_name_len]).unwrap_or("")
+    }
+
+    /// Только имя файла без каталога — для статусной строки.
+    pub fn file_name_only(&self) -> &str {
+        let s = self.file_str();
+        s.rsplit(['\\', '/']).next().unwrap_or(s)
     }
 
     pub fn status_str(&self) -> &str {
@@ -476,6 +497,52 @@ pub fn hit(rect: Rect, x: i32, y: i32) -> bool {
     x >= rect.0 && x <= rect.0 + rect.2 && y >= rect.1 && y <= rect.1 + rect.3
 }
 
+// ---------------------------------------------------------------- тулбар
+
+/// Кнопки верхней полосы. Порядок = порядок на экране, `u8` — код действия,
+/// который окно разбирает в одном месте (никакой логики в рендере).
+pub const TOOLBAR: [(&str, u8); 7] = [
+    ("ОТКРЫТЬ", 1),
+    ("КАТАЛОГ", 2),
+    ("ПРАВИТЬ", 3),
+    ("КОММЕНТ.", 4),
+    ("СОХРАНИТЬ", 5),
+    ("ВПИСАТЬ", 6),
+    ("СПРАВКА", 7),
+];
+
+/// Ширина кнопки — фиксированная, чтобы тулбар не «прыгал» при наведении.
+pub const TOOL_W: i32 = 132;
+pub const TOOL_H: i32 = 40;
+
+/// Прямоугольник кнопки `i` в верхней полосе. O(1).
+pub fn toolbar_rect(i: usize) -> Rect {
+    // левый блок (DXFSIGN + имя файла + счётчики) занимает 120 px, тулбар — правее
+    let x = swiss::MARGIN + 136 + i as i32 * (TOOL_W + 8);
+    let y = (swiss::TOP_H - TOOL_H) / 2;
+    (x, y, TOOL_W, TOOL_H)
+}
+
+/// Строка каталога `i` в левой панели. O(1).
+pub fn left_row_rect(i: usize) -> Rect {
+    let x = 0;
+    let y = swiss::TOP_H + swiss::MARGIN + 26 + i as i32 * swiss::ROW_H;
+    (x, y, swiss::LEFT_W - swiss::RULE_W, swiss::ROW_H)
+}
+
+/// Строка списка надписей `i` при заданной высоте блока каталога. O(1).
+pub fn left_text_row_rect(cat_bottom: i32, i: usize) -> Rect {
+    let y = cat_bottom + 40 + i as i32 * swiss::ROW_H;
+    (0, y, swiss::LEFT_W - swiss::RULE_W, swiss::ROW_H)
+}
+
+/// Низ блока каталога в левой панели — по нему окно понимает, где начинается
+/// список надписей (одна формула на рендер и на попадание мышью).
+pub fn left_catalog_bottom(catalog_len: usize) -> i32 {
+    let rows = catalog_len.min(6) as i32;
+    swiss::TOP_H + swiss::MARGIN + 26 + rows * swiss::ROW_H
+}
+
 // ---------------------------------------------------------------- кадр целиком
 
 pub struct Renderer {
@@ -574,6 +641,7 @@ impl Renderer {
             let x = vx + self.sx[i];
             let y = vy + self.sy[i];
             let selected = ui.selected_text == Some(ti);
+            let hovered = ui.hover_text == Some(ti) && !selected;
             let s = String::from_utf8_lossy(doc.arena_get(t.s));
             let wd = tp.measure(px, false, &s);
             if selected {
@@ -587,6 +655,9 @@ impl Renderer {
                 self.fb.fill_rect(bx - 10, by, 6, bh, swiss::ACCENT);
                 self.fb.fill_rect(bx, y + 8, bw, 3, swiss::ACCENT);
             }
+            if hovered {
+                self.fb.stroke_rect(x - 6, y - px - 6, wd + 12, px + 12, 2, swiss::MUTED);
+            }
             tp.text(&mut self.fb, x, y - px, px, false, swiss::INK, &s);
             // MTEXT помечается квадратом у базовой линии — видно, что абзац
             if t.kind == TEXT_KIND_MTEXT {
@@ -594,18 +665,18 @@ impl Renderer {
             }
         }
 
-        // --- верхняя полоса: заголовок + имя файла
+        // --- верхняя полоса: имя файла + кнопки тулбара
         self.fb.fill_rect(0, 0, w, swiss::TOP_H, swiss::INK);
-        tp.text(&mut self.fb, swiss::MARGIN, 14, swiss::T_LABEL, true, swiss::PAPER, "DXFSIGN");
-        tp.text(&mut self.fb, swiss::MARGIN + 104, 18, swiss::T_BODY, false, swiss::RULE, ui.file_str());
-        // цифры форматируются в стек, без String: кадр не аллоцирует
+        tp.text(&mut self.fb, swiss::MARGIN, 10, swiss::T_LABEL, true, swiss::PAPER, "DXFSIGN");
+
+        // счётчики под именем файла: сущности, масштаб, путь проекции
         let mut d1 = [0u8; 10];
         let mut d2 = [0u8; 10];
         let e_s = concat_u32(&mut d1, ui.entities, "");
-        let z_s = concat_u32(&mut d2, ui.zoom_pct, "");
+        let z_s = concat_u32(&mut d2, ui.zoom_pct, "%");
         let mut tail = [0u8; 64];
         let mut tail_len = 0usize;
-        for part in [e_s, " об · ", z_s, "% · ", ui.backend] {
+        for part in [e_s, " об · ", z_s, " · ", ui.backend] {
             for &b in part.as_bytes() {
                 if tail_len < tail.len() {
                     tail[tail_len] = b;
@@ -613,28 +684,111 @@ impl Renderer {
                 }
             }
         }
-        let right = std::str::from_utf8(&tail[..tail_len]).unwrap_or("");
-        let rw = tp.measure(swiss::T_CAPTION, false, right);
-        tp.text(&mut self.fb, w - swiss::MARGIN - rw, 20, swiss::T_CAPTION, false, swiss::RULE, right);
+        let counters = std::str::from_utf8(&tail[..tail_len]).unwrap_or("");
+        let counters = clip(tp, swiss::T_CAPTION, false, 132, counters);
+        tp.text(&mut self.fb, swiss::MARGIN, 36, swiss::T_CAPTION, false, swiss::MUTED, counters);
+
+        for (i, (label, _)) in TOOLBAR.iter().enumerate() {
+            let (bx, by, bw, bh) = toolbar_rect(i);
+            if bx + bw > w - 16 {
+                break;
+            }
+            let hovered = crate::render::hit((bx, by, bw, bh), ui.mouse.0, ui.mouse.1);
+            let pressed = ui.pressed_tool == Some(i);
+            let (bg, fg, border) = if pressed {
+                (swiss::ACCENT, swiss::PAPER, swiss::ACCENT)
+            } else if hovered {
+                (swiss::PAPER, swiss::INK, swiss::PAPER)
+            } else {
+                (swiss::INK, swiss::RULE, swiss::RULE)
+            };
+            if pressed || hovered {
+                self.fb.fill_rect(bx, by, bw, bh, bg);
+            }
+            self.fb.stroke_rect(bx, by, bw, bh, swiss::RULE_W, border);
+            tp.text(&mut self.fb, bx + 18, by + 10, swiss::T_CAPTION, true, fg, label);
+        }
         self.fb.fill_rect(0, swiss::TOP_H - swiss::RULE_W, w, swiss::RULE_W, swiss::ACCENT);
 
-        // --- левая панель: каталог сетевого диска (12-колоночная сетка внутри)
+        // --- левая панель: каталог сетевого диска + список надписей чертежа
         let lh = h - swiss::TOP_H - swiss::STATUS_H;
         self.fb.fill_rect(0, swiss::TOP_H, swiss::LEFT_W, lh, swiss::WHITE);
         self.fb.fill_rect(swiss::LEFT_W - swiss::RULE_W, swiss::TOP_H, swiss::RULE_W, lh, swiss::INK);
-        tp.text(&mut self.fb, swiss::MARGIN, swiss::TOP_H + swiss::MARGIN, swiss::T_CAPTION, true, swiss::MUTED, "КАТАЛОГ");
-        let list_y0 = swiss::TOP_H + swiss::MARGIN + 24;
-        let rows = ((lh - swiss::MARGIN * 2 - 24) / swiss::ROW_H).max(0) as usize;
-        for (i, name) in ui.catalog_names.iter().enumerate().take(rows) {
-            let y = list_y0 + i as i32 * swiss::ROW_H;
+        let pad = swiss::MARGIN;
+        // --- каталог (верхняя треть) на подложке, чтобы блоки панели различались
+        let cat_rows_n = ui.catalog_names.len().min(6);
+        let cat_block_h = swiss::MARGIN + 26 + cat_rows_n as i32 * swiss::ROW_H + 14;
+        self.fb.fill_rect(0, swiss::TOP_H, swiss::LEFT_W - swiss::RULE_W, cat_block_h, swiss::CANVAS);
+        tp.text(&mut self.fb, pad, swiss::TOP_H + pad, swiss::T_CAPTION, true, swiss::MUTED, "КАТАЛОГ СЕТЕВОГО ДИСКА");
+        let list_y0 = swiss::TOP_H + pad + 26;
+        let cat_rows = ui.catalog_names.len().min(6);
+        for i in 0..cat_rows {
+            let (rx, ry, rw, rh) = left_row_rect(i);
+            let hovered = hit((rx, ry, rw, rh), ui.mouse.0, ui.mouse.1);
             if i == ui.selected_catalog {
-                self.fb.fill_rect(0, y, swiss::LEFT_W - swiss::RULE_W, swiss::ROW_H, swiss::INK);
-                self.fb.fill_rect(0, y, 4, swiss::ROW_H, swiss::ACCENT);
-                tp.text(&mut self.fb, swiss::MARGIN, y + 5, swiss::T_BODY, true, swiss::PAPER, name);
+                self.fb.fill_rect(rx, ry, rw, rh, swiss::INK);
+                self.fb.fill_rect(rx, ry, 5, rh, swiss::ACCENT);
+                let cname = clip(tp, swiss::T_BODY, true, rw - 28, &ui.catalog_names[i]);
+                tp.text(&mut self.fb, rx + 14, ry + 8, swiss::T_BODY, true, swiss::PAPER, cname);
             } else {
-                tp.text(&mut self.fb, swiss::MARGIN, y + 5, swiss::T_BODY, false, swiss::INK, name);
-                self.fb.fill_rect(swiss::MARGIN, y + swiss::ROW_H - 1, swiss::LEFT_W - swiss::MARGIN * 2, 1, swiss::RULE);
+                if hovered {
+                    self.fb.fill_rect(rx, ry, rw, rh, swiss::CANVAS);
+                }
+                let cname = clip(tp, swiss::T_BODY, false, rw - 28, &ui.catalog_names[i]);
+                tp.text(&mut self.fb, rx + 14, ry + 8, swiss::T_BODY, false, swiss::INK, cname);
+                self.fb.fill_rect(rx + 14, ry + rh - 1, rw - 28, 1, swiss::RULE);
             }
+        }
+        let cat_bottom = list_y0 + cat_rows as i32 * swiss::ROW_H;
+
+        // --- список надписей (ниже каталога) — главный инструмент: правят текст
+        self.fb.fill_rect(0, cat_bottom, swiss::LEFT_W - swiss::RULE_W, swiss::RULE_W * 2, swiss::INK);
+        self.fb.fill_rect(0, cat_bottom + swiss::RULE_W * 2, swiss::LEFT_W - swiss::RULE_W, 10, swiss::WHITE);
+        let hdr = swiss::TOP_H + cat_bottom - swiss::TOP_H + 12;
+        let mut hb = [0u8; 48];
+        let hdr = concat_u32(&mut hb, doc.texts.len() as u32, " НАДПИСЕЙ · клик = выбор");
+        tp.text(&mut self.fb, pad, cat_bottom + 20, swiss::T_CAPTION, true, swiss::MUTED, hdr);
+        let rows_y0 = cat_bottom + 40 + 10;
+        let rows_avail = ((swiss::TOP_H + lh) - rows_y0 - 8).max(0) / swiss::ROW_H;
+        let rows = rows_avail.max(0) as usize;
+        let _ = hdr;
+        for i in 0..rows {
+            let idx = ui.texts_scroll + i;
+            if idx >= doc.texts.len() {
+                break;
+            }
+            let (rx, ry, rw, rh) = left_text_row_rect(cat_bottom + 10, i);
+            if ry + rh > swiss::TOP_H + lh - 4 {
+                break;
+            }
+            let t = &doc.texts[idx];
+            let s = String::from_utf8_lossy(doc.arena_get(t.s));
+            let selected = ui.selected_text == Some(idx);
+            let hovered = hit((rx, ry, rw, rh), ui.mouse.0, ui.mouse.1) || ui.hover_text == Some(idx);
+            if selected {
+                self.fb.fill_rect(rx, ry, rw, rh, swiss::INK);
+                self.fb.fill_rect(rx, ry, 5, rh, swiss::ACCENT);
+                let cs = clip(tp, swiss::T_BODY, true, rw - 28, &s);
+                tp.text(&mut self.fb, rx + 14, ry + 8, swiss::T_BODY, true, swiss::PAPER, cs);
+            } else {
+                if hovered {
+                    self.fb.fill_rect(rx, ry, rw, rh, swiss::CANVAS);
+                }
+                let col = if t.wire.is_empty() { swiss::INK } else { swiss::ACCENT };
+                let cs2 = clip(tp, swiss::T_BODY, false, rw - 28, &s);
+                tp.text(&mut self.fb, rx + 14, ry + 8, swiss::T_BODY, false, col, cs2);
+                self.fb.fill_rect(rx + 14, ry + rh - 1, rw - 28, 1, swiss::RULE);
+            }
+        }
+        // признак прокрутки: тонкая полоса справа, если надписей больше, чем строк
+        if doc.texts.len() > rows {
+            let track_h = (rows as i32 * swiss::ROW_H).max(1);
+            let frac = rows as f32 / doc.texts.len() as f32;
+            let thumb_h = (track_h as f32 * frac).max(24.0) as i32;
+            let max_scroll = doc.texts.len().saturating_sub(rows).max(1) as f32;
+            let pos = (ui.texts_scroll as f32 / max_scroll).clamp(0.0, 1.0);
+            let ty = rows_y0 + ((track_h - thumb_h) as f32 * pos) as i32;
+            self.fb.fill_rect(swiss::LEFT_W - 12, ty, 6, thumb_h, swiss::MUTED);
         }
 
         // --- правая панель: свойства выбранной надписи
@@ -700,11 +854,26 @@ impl Renderer {
             }
         }
 
-        // --- статусная строка
+        // --- статусная строка: слева состояние, справа файл
         self.fb.fill_rect(0, h - swiss::STATUS_H, w, swiss::STATUS_H, swiss::INK);
-        tp.text(&mut self.fb, swiss::MARGIN, h - swiss::STATUS_H + 9, swiss::T_CAPTION, false, swiss::PAPER, ui.status_str());
+        let fname_w = 420.min(w / 3);
+        let status = clip(tp, swiss::T_CAPTION, false, w - swiss::MARGIN * 2 - fname_w - 24, ui.status_str());
+        tp.text(&mut self.fb, swiss::MARGIN, h - swiss::STATUS_H + 13, swiss::T_CAPTION, false, swiss::PAPER, status);
+        let fname = clip(tp, swiss::T_CAPTION, false, fname_w, ui.file_name_only());
+        let fw = tp.measure(swiss::T_CAPTION, false, fname);
+        tp.text(&mut self.fb, w - swiss::MARGIN - fw, h - swiss::STATUS_H + 13, swiss::T_CAPTION, false, swiss::MUTED, fname);
 
         // --- модальный запрос номера провода и комментария
+        if ui.help_open {
+            let fields: [(&str, &str, bool); 5] = [
+                ("МЫШЬ", "клик — выбрать · 2×клик — править · колесо — зум", false),
+                ("ПАНОРАМА", "средняя или правая кнопка: потянуть", false),
+                ("ФАЙЛ", "Ctrl+O открыть · F4 каталог · Ctrl+S сохранить", false),
+                ("ПРАВКА", "F2 текст · F3 комментарий · Tab · Enter · Esc", false),
+                ("ВИД", "F7 вписать · PgUp/PgDn масштаб · F1 справка", false),
+            ];
+            self.draw_form(tp, "ГОРЯЧИЕ КЛАВИШИ И МЫШЬ", "Esc или кнопка внизу — закрыть", &fields, "");
+        }
         if session.is_busy() {
             let focus = ui.focus;
             self.draw_modal(session, tp, focus);
@@ -835,9 +1004,10 @@ impl Renderer {
             tp.text(&mut self.fb, fr.0, fr.1 - 20, swiss::T_CAPTION, true, swiss::MUTED, label);
             let color = if *focused { swiss::INK } else { swiss::RULE };
             self.fb.stroke_rect(fr.0, fr.1, fr.2, fr.3, swiss::RULE_W, color);
-            tp.text(&mut self.fb, fr.0 + 12, fr.1 + 12, swiss::T_LABEL, false, swiss::INK, value);
+            let vshow = clip(tp, swiss::T_BODY, false, fr.2 - 24, value);
+            tp.text(&mut self.fb, fr.0 + 12, fr.1 + 13, swiss::T_BODY, false, swiss::INK, vshow);
             if *focused {
-                let m = tp.measure(swiss::T_LABEL, false, value);
+                let m = tp.measure(swiss::T_BODY, false, vshow);
                 self.fb.fill_rect(fr.0 + 14 + m, fr.1 + 10, 3, 26, swiss::ACCENT);
             }
         }

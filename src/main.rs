@@ -309,6 +309,15 @@ fn cmd_snapshot(args: &[String]) {
     ui.catalog_names.push("Щиты".to_string());
     ui.catalog_names.push("Версии".to_string());
     ui.set_spool("_SPOOL (каталог спула из dxfsign.ini)");
+    if let Some(h) = arg_val(args, "--hover").and_then(|v| v.parse::<usize>().ok()) {
+        ui.hover_text = Some(h);
+        ui.mouse = (w as i32 / 2, h as i32 / 2);
+    } else {
+        ui.mouse = (-1, -1);
+    }
+    if has_flag(args, "--help") {
+        ui.help_open = true;
+    }
     ui.set_last("ещё не сохраняли в этой сессии");
     if let Some(i) = arg_val(args, "--idx").and_then(|v| v.parse::<usize>().ok()) {
         ui.selected_text = Some(i);

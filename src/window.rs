@@ -149,6 +149,12 @@ extern "system" {
     fn FreeConsole() -> i32;
 }
 
+#[link(name = "user32")]
+extern "system" {
+    fn SetCapture(hwnd: Hwnd) -> Hwnd;
+    fn ReleaseCapture() -> i32;
+}
+
 #[link(name = "gdi32")]
 extern "system" {
     fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
@@ -190,6 +196,11 @@ const WM_CHAR: u32 = 0x0102;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_RBUTTONDOWN: u32 = 0x0204;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_TIMER: u32 = 0x0113;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -265,6 +276,13 @@ struct Ctx {
     renderer: Renderer,
     painter: GdiPainter,
     cam: Camera,
+    /// Центр вида в мировых координатах и масштаб — единственный источник правды
+    /// для камеры. Раньше кадр каждый раз пересчитывал камеру от границ чертежа,
+    /// поэтому панорама и зум сбрасывались.
+    view_center: (f64, f64),
+    zoom: f64,
+    panning: bool,
+    pan_from: (i32, i32),
     hwnd: Hwnd,
     mem_dc: Hdc,
     bmp: Hbitmap,
@@ -339,19 +357,16 @@ fn render_and_present() {
     c.renderer.fb.resize(w as usize, h as usize);
     let view_w = (w - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
     let view_h = (h - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
-    if c.cam.scale <= 0.0 {
-        c.cam = Camera::fit(c.doc.bounds(), view_w, view_h, 32);
+    if c.zoom <= 0.0 {
+        let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
+        c.zoom = fit.scale;
+        let (x0, y0, x1, y1) = c.doc.bounds();
+        c.view_center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
     }
-    // камера пересчитывается под текущий размер окна с сохранением центра
-    let (x0, y0, x1, y1) = c.doc.bounds();
-    let cx = (x0 + x1) * 0.5;
-    let cy = (y0 + y1) * 0.5;
-    let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 32);
-    let scale = if c.cam.scale > 0.0 { c.cam.scale } else { fit.scale };
     c.cam = Camera {
-        scale,
-        ox: view_w as f64 * 0.5 - cx * scale,
-        oy: view_h as f64 * 0.5 + cy * scale,
+        scale: c.zoom,
+        ox: view_w as f64 * 0.5 - c.view_center.0 * c.zoom,
+        oy: view_h as f64 * 0.5 + c.view_center.1 * c.zoom,
     };
     c.ui.focus = c.focus;
     let session = &c.session;
@@ -466,6 +481,93 @@ fn start_edit(comment_only: bool) {
     c.focus = if comment_only { 2 } else { 0 };
 }
 
+/// Вписать чертёж в окно (центр + масштаб). O(1) по границам.
+/// Одно место для действий тулбара: код -> вызов. Кнопки и клавиши ходят сюда же.
+fn run_tool(code: u8) {
+    let c = ctx();
+    match code {
+        1 => {
+            let start = save_dir_of(&c.doc.path);
+            if let Some(path) = dialogs::open_dxf_dialog(c.hwnd, start.as_deref()) {
+                open_path(&path);
+            } else {
+                set_flash("Открытие отменено");
+            }
+        }
+        2 => {
+            c.editor.open = true;
+            c.editor.sel = 0;
+            load_editor_from_cfg();
+            c.editor.note("Ins добавить · Del удалить · F5 выбрать папку · Enter сохранить");
+        }
+        3 => start_edit(false),
+        4 => start_edit(true),
+        5 => {
+            if c.session.is_busy() {
+                set_flash("Сначала примите правку (Enter) или отмените (Esc)");
+            } else if c.doc.log.is_empty() {
+                set_flash("Нет правок в этой сессии — сохранять нечего");
+            } else {
+                do_save();
+            }
+        }
+        6 => fit_view(),
+        7 => {
+            c.ui.help_open = !c.ui.help_open;
+            set_flash(if c.ui.help_open { "Справка: Esc или кнопка «СОХРАНИТЬ» закрывает" } else { "Справка закрыта" });
+        }
+        _ => {}
+    }
+}
+
+fn fit_view() {
+    let c = ctx();
+    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+    let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
+    let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
+    c.zoom = fit.scale;
+    let (x0, y0, x1, y1) = c.doc.bounds();
+    c.view_center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+    set_flash("Чертёж вписан в окно");
+}
+
+/// Зум вокруг точки экрана: мировая точка под курсором остаётся на месте.
+/// O(1). Иначе зум «прыгает» и человек теряет место, где работал.
+fn zoom_at(screen_x: i32, screen_y: i32, factor: f64) {
+    let c = ctx();
+    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
+    let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
+    let lx = (screen_x - crate::render::swiss::LEFT_W) as f64;
+    let ly = (screen_y - crate::render::swiss::TOP_H) as f64;
+    let s = c.zoom.max(1e-9);
+    // мировая точка под курсором до зума
+    let wx = (lx - view_w as f64 * 0.5) / s + c.view_center.0;
+    let wy = (view_h as f64 * 0.5 - ly) / s + c.view_center.1;
+    let s2 = (s * factor).clamp(0.005, 400.0);
+    // после зума держим ту же точку под тем же пикселем
+    c.view_center.0 = wx - (lx - view_w as f64 * 0.5) / s2;
+    c.view_center.1 = wy - (view_h as f64 * 0.5 - ly) / s2;
+    c.zoom = s2;
+}
+
+/// Панорама мышью в пикселях: сдвигаем центр вида. O(1).
+fn pan_by(dx: i32, dy: i32) {
+    let c = ctx();
+    let s = c.zoom.max(1e-9);
+    c.view_center.0 -= dx as f64 / s;
+    c.view_center.1 += dy as f64 / s;
+}
+
+fn scroll_texts(delta: i32) {
+    let c = ctx();
+    let rows = ((c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H)
+        / crate::render::swiss::ROW_H)
+        .max(1) as usize;
+    let max_scroll = c.doc.texts.len().saturating_sub(rows.min(c.doc.texts.len()));
+    let cur = c.ui.texts_scroll as i32 + delta;
+    c.ui.texts_scroll = cur.clamp(0, max_scroll as i32) as usize;
+}
+
 fn save_dir_of(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -550,7 +652,13 @@ fn open_path(path: &str) {
     c.renderer.sy.resize(c.doc.xs.len().max(64) * 2, 0);
     let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
     let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
-    c.cam = Camera::fit(c.doc.bounds(), view_w, view_h, 32);
+    c.zoom = 0.0;
+    c.ui.texts_scroll = 0;
+    let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
+    c.zoom = fit.scale;
+    let (x0, y0, x1, y1) = c.doc.bounds();
+    c.view_center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+    c.cam = fit;
     let msg = format!("Открыт {}: надписей {}", path, c.doc.texts.len());
     set_flash(&msg);
 }
@@ -601,6 +709,59 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             0
         }
         WM_GETMINMAXINFO => DefWindowProcA(hwnd, msg, wp, lp),
+        WM_MOUSEMOVE => {
+            let x = (lp & 0xFFFF) as i16 as i32;
+            let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
+            let c = ctx();
+            let prev = c.ui.mouse;
+            c.ui.mouse = (x, y);
+            if c.panning {
+                let (px, py) = c.pan_from;
+                pan_by(x - px, y - py);
+                c.pan_from = (x, y);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            // подсветка надписи под курсором — только когда курсор над канвой
+            let over_canvas = x > crate::render::swiss::LEFT_W
+                && x < (c.renderer.fb.w as i32 - crate::render::swiss::RIGHT_W)
+                && y > crate::render::swiss::TOP_H;
+            let hover = if over_canvas { hit_test_text(x, y) } else { None };
+            if hover != c.ui.hover_text || prev != c.ui.mouse {
+                c.ui.hover_text = hover;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_MBUTTONDOWN | WM_RBUTTONDOWN => {
+            let c = ctx();
+            let x = (lp & 0xFFFF) as i16 as i32;
+            let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
+            c.panning = true;
+            c.pan_from = (x, y);
+            unsafe {
+                SetCapture(hwnd);
+            }
+            set_flash("Панорама: тяните мышью; отпустите кнопку");
+            0
+        }
+        WM_MBUTTONUP | WM_RBUTTONUP => {
+            let c = ctx();
+            if c.panning {
+                c.panning = false;
+                unsafe {
+                    ReleaseCapture();
+                }
+                set_flash("Панорама завершена");
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_CAPTURECHANGED => {
+            let c = ctx();
+            c.panning = false;
+            0
+        }
         WM_LBUTTONDOWN => {
             let x = (lp & 0xFFFF) as i16 as i32;
             let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
@@ -608,6 +769,30 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             let mut cr = Rect::default();
             GetClientRect(hwnd, &mut cr);
             let (cw, ch) = (cr.right - cr.left, cr.bottom - cr.top);
+            c.ui.mouse = (x, y);
+
+            // ---------- тулбар: самый верхний слой, всегда первый
+            for (i, (_, code)) in crate::render::TOOLBAR.iter().enumerate() {
+                if crate::render::hit(crate::render::toolbar_rect(i), x, y) {
+                    c.ui.pressed_tool = Some(i);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    run_tool(*code);
+                    c.ui.pressed_tool = None;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+            }
+
+            // ---------- справка: клик по кнопке формы закрывает её
+            if c.ui.help_open {
+                let n = 4usize;
+                if crate::render::hit(crate::render::form_accept_rect(cw, ch, n), x, y) {
+                    c.ui.help_open = false;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                return 0;
+            }
 
             // ---------- клики по форме редактора каталога (приоритет — модалка сверху)
             if c.editor.open {
@@ -670,14 +855,31 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                 return 0;
             }
 
-            // 1) клик по левой панели — выбор записи каталога
+            // 1) левая панель: каталог сверху, список надписей ниже
             if x < crate::render::swiss::LEFT_W && y > crate::render::swiss::TOP_H {
-                let list_y0 = crate::render::swiss::TOP_H + crate::render::swiss::MARGIN + 32;
-                let idx = ((y - list_y0) / crate::render::swiss::ROW_H).max(0) as usize;
-                if idx < c.ui.catalog_names.len() && y >= list_y0 {
-                    c.ui.selected_catalog = idx;
-                    let s = format!("Каталог: {}", c.ui.catalog_names[idx]);
-                    set_flash(&s);
+                let cat_rows = c.ui.catalog_names.len().min(6);
+                for i in 0..cat_rows {
+                    if crate::render::hit(crate::render::left_row_rect(i), x, y) {
+                        c.ui.selected_catalog = i;
+                        let s = format!("Каталог: {}", c.ui.catalog_names[i]);
+                        set_flash(&s);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
+                let cat_bottom = crate::render::left_catalog_bottom(c.ui.catalog_names.len()) + 10;
+                if y > cat_bottom + 40 {
+                    let row = ((y - cat_bottom - 40) / crate::render::swiss::ROW_H).max(0) as usize;
+                    let idx = c.ui.texts_scroll + row;
+                    if idx < c.doc.texts.len() {
+                        c.ui.selected_text = Some(idx);
+                        let s = format!(
+                            "Выбрана надпись [{}]: \"{}\" — F2 править",
+                            idx,
+                            String::from_utf8_lossy(c.doc.arena_get(c.doc.texts[idx].s))
+                        );
+                        set_flash(&s);
+                    }
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
@@ -714,10 +916,17 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             0
         }
         WM_MOUSEWHEEL => {
+            // wp приходит в экранных координатах; пользуемся последней позицией
+            // курсора из WM_MOUSEMOVE — она в координатах клиента.
             let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
             let c = ctx();
-            let f = if delta > 0 { 1.15 } else { 1.0 / 1.15 };
-            c.cam.scale = (c.cam.scale * f).clamp(0.01, 1000.0);
+            let (mx, my) = c.ui.mouse;
+            if mx >= 0 && mx < crate::render::swiss::LEFT_W && my > crate::render::swiss::TOP_H {
+                scroll_texts(if delta > 0 { -3 } else { 3 });
+            } else {
+                let f = if delta > 0 { 1.18 } else { 1.0 / 1.18 };
+                zoom_at(mx.max(0), my.max(0), f);
+            }
             InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
@@ -833,7 +1042,10 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     }
                 }
                 VK_ESCAPE => {
-                    if c.session.is_busy() {
+                    if c.ui.help_open {
+                        c.ui.help_open = false;
+                        set_flash("Справка закрыта");
+                    } else if c.session.is_busy() {
                         let o = c.session.cancel();
                         set_flash(if o == Outcome::Canceled {
                             "Правка отменена: файл не тронут"
@@ -845,6 +1057,20 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     }
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
+                0x70 => {
+                    // F1 — справка
+                    run_tool(7);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                0x21 | 0x22 => {
+                    // PgUp / PgDn — масштаб вокруг центра канвы
+                    let cw = c.renderer.fb.w as i32;
+                    let chh = c.renderer.fb.h as i32;
+                    let mx = crate::render::swiss::LEFT_W + (cw - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W) / 2;
+                    let my = crate::render::swiss::TOP_H + (chh - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H) / 2;
+                    zoom_at(mx, my, if wp == 0x21 { 1.25 } else { 1.0 / 1.25 });
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 VK_RETURN => {
                     if c.session.is_busy() {
                         submit_modal();
@@ -852,36 +1078,27 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     }
                 }
                 VK_ADD | VK_OEM_PLUS => {
-                    c.cam.scale *= 1.25;
+                    let (mx, my) = c.ui.mouse;
+                    zoom_at(mx.max(crate::render::swiss::LEFT_W + 40), my.max(crate::render::swiss::TOP_H + 40), 1.25);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 VK_SUBTRACT | VK_OEM_MINUS => {
-                    c.cam.scale /= 1.25;
+                    let (mx, my) = c.ui.mouse;
+                    zoom_at(mx.max(crate::render::swiss::LEFT_W + 40), my.max(crate::render::swiss::TOP_H + 40), 1.0 / 1.25);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 VK_F4 => {
-                    c.editor.open = true;
-                    c.editor.sel = 0;
-                    load_editor_from_cfg();
-                    c.editor.note("Ins — добавить · Del — удалить · F5 — выбрать папку · Enter — сохранить");
+                    run_tool(2);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 VK_O => {
                     if ctrl {
-                        let start = save_dir_of(&c.doc.path);
-                        if let Some(path) = dialogs::open_dxf_dialog(hwnd, start.as_deref()) {
-                            open_path(&path);
-                        } else {
-                            set_flash("Открытие отменено");
-                        }
+                        run_tool(1);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 }
                 VK_F7 => {
-                    let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
-                    let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
-                    c.cam = Camera::fit(c.doc.bounds(), view_w, view_h, 32);
-                    set_flash("Вписано в окно");
+                    fit_view();
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 0x53 => {
@@ -930,7 +1147,10 @@ pub fn run(
         // приложение (чтобы работали команды CLI), поэтому отцепляемся — иначе
         // рядом с окном остаётся чёрное окно консоли.
         let _ = FreeConsole();
-        let _ = SetProcessDPIAware();
+        // SetProcessDPIAware НЕ вызываем осознанно: интерфейс рисуется в пикселях
+        // 1:1, и на 125–150% DPI системное масштабирование даёт правильный размер
+        // (чуть мягче), тогда как принудительный DPI-aware делал всё мелким.
+        let _ = SetProcessDPIAware;
         let hinst = GetModuleHandleA(std::ptr::null());
         let class_name = b"dxfsign_window\x00";
         let wc = WndClassA {
@@ -975,6 +1195,10 @@ pub fn run(
             renderer,
             painter,
             cam,
+            view_center: (0.0, 0.0),
+            zoom: 0.0,
+            panning: false,
+            pan_from: (0, 0),
             hwnd: 0,
             mem_dc,
             bmp: 0,
