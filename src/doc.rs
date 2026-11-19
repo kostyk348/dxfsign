@@ -154,6 +154,9 @@ pub struct Doc {
     pub texts: Vec<TextEnt>,
     pub handles: Vec<Handle>, // параллельно texts: стабильный адрес сущности для UI
     pub layers: Vec<Layer>,
+    /// Имя слоя -> индекс. Без этой карты каждая сущность сканировала весь список
+    /// слоёв (на реальных чертежах их сотни, сущностей — сотни тысяч).
+    layer_map: std::collections::HashMap<Vec<u8>, u16>,
     pub arena: TextArena,
     pub log: ChangeLog,
     /// Путь рабочего файла (UTF-8, для лога и письма).
@@ -178,6 +181,7 @@ impl Doc {
             texts: Vec::with_capacity(hint / 2),
             handles: Vec::with_capacity(hint / 2),
             layers: Vec::with_capacity(16),
+            layer_map: std::collections::HashMap::with_capacity(64),
             arena: TextArena::with_capacity(hint * 24),
             log: ChangeLog::with_capacity(1024),
             path: String::with_capacity(260),
@@ -196,6 +200,7 @@ impl Doc {
         self.texts.clear();
         self.handles.clear();
         self.layers.clear();
+        self.layer_map.clear();
         self.log.clear();
         self.path.clear();
         self.dxf_version.clear();
@@ -232,18 +237,19 @@ impl Doc {
         i
     }
 
+    /// Индекс слоя по имени. O(1) по хеш-карте (было O(L) с побайтовым сравнением).
     pub fn layer_index(&mut self, name: &[u8]) -> u16 {
-        for (i, l) in self.layers.iter().enumerate() {
-            if self.arena.get(l.name) == name {
-                return i as u16;
-            }
+        if let Some(i) = self.layer_map.get(name) {
+            return *i;
         }
         if self.layers.len() >= u16::MAX as usize {
             return 0;
         }
         let (r, _) = self.arena.push(name);
+        let idx = self.layers.len() as u16;
         self.layers.push(Layer { name: r, color: 7 });
-        (self.layers.len() - 1) as u16
+        self.layer_map.insert(name.to_vec(), idx);
+        idx
     }
 
     /// Сколько сущностей всех типов — для статусной строки и для оценки O.

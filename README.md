@@ -45,6 +45,8 @@ dxfsign.exe --version
   `.txt`), HMAC-SHA256 over a canonical string, anchor row in `_VERSIONS/index.tsv`;
 * network-drive catalog in an INI file with an in-app **catalog editor** (`F4`, system folder picker),
   file open via `Ctrl+O` or drag-and-drop;
+* **background loading**: the window appears at once, the overlay shows stage/percent/entity count and
+  `Esc` cancels — a drawing with 820 000 entities is on screen in 0.3 s;
 * **Win32 window without a GUI framework**: toolbar, hover and selection highlight, wheel zoom
   **anchored under the cursor**, middle/right-button pan, list scrolling, `F1` help;
 * **performance**: frames allocate nothing (asserted in tests), AVX2 projection with runtime dispatch
@@ -98,6 +100,18 @@ require_wire = true
 SW-3  = \\srv\\projects\\sw-3\\dxf
 Panels = \\srv\\projects\\panels
 ```
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `access denied (os error 5)` on save | The folder denies write access, or the file carries the read-only attribute. The program now names the exact cause; clear the attribute (`attrib -R file.dxf`) or save elsewhere — when access is denied the edit goes to `%LOCALAPPDATA%\dxfsign\outbox` instead of being lost. |
+| `file is in use by another program` | The drawing is open in AutoCAD or held by an antivirus — close it and retry. |
+| Slow to open / appears frozen | Reading and parsing now run on a worker thread: the window shows up immediately with stage, percent and entity count, `Esc` cancels. Files over 1.5 GB or over 4 M expanded entities are reported instead of hanging. |
+| Nothing is drawn but the status shows entities | The file contains only unsupported types (`HATCH`, `DIMENSION`, `LEADER`, `XREF`) — counted in `report`, not drawn. |
+| Cyrillic text looks garbled | A legacy file was classified as UTF-8 or vice versa. `dxfsign.exe report file.dxf` prints `$ACADVER`. |
+| It is a DWG | DWG is not supported: in AutoCAD use Save As → DXF. |
+| I need to save elsewhere | CLI: `dxfsign.exe save draft.edited.dxf --working path.dxf --fallback`. In the window the fallback path is shown in the status bar. |
 
 ## Verified / not verified
 

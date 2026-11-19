@@ -137,6 +137,7 @@ extern "system" {
     fn GetClientRect(hwnd: Hwnd, r: *mut Rect) -> i32;
     fn InvalidateRect(hwnd: Hwnd, r: *const Rect, erase: i32) -> i32;
     fn SetTimer(hwnd: Hwnd, id: usize, ms: u32, proc: *const c_void) -> usize;
+    fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
     fn GetKeyState(vk: i32) -> i16;
     fn SetProcessDPIAware() -> i32;
     fn LoadCursorA(inst: Hinstance, name: *const u8) -> Hcursor;
@@ -205,6 +206,7 @@ const WM_MBUTTONUP: u32 = 0x0208;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_DROPFILES: u32 = 0x0233;
+const TIMER_LOAD: usize = 3;
 const WM_TIMER: u32 = 0x0113;
 const WM_CLOSE: u32 = 0x0010;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -270,8 +272,16 @@ impl CatEditor {
     }
 }
 
+/// Идущая фоновая загрузка: прогресс и канал с результатом.
+struct PendingLoad {
+    prog: crate::loader::Progress,
+    rx: std::sync::mpsc::Receiver<crate::loader::Loaded>,
+    path: String,
+}
+
 struct Ctx {
     cfg: AppConfig,
+    pending: Option<PendingLoad>,
     cfg_path: String,
     editor: CatEditor,
     doc: Doc,
@@ -375,6 +385,9 @@ fn render_and_present() {
     c.ui.focus = c.focus;
     let session = &c.session;
     let _ = c.renderer.frame(&c.doc, c.cam, &mut c.ui, session, &mut c.painter);
+    if c.pending.is_some() {
+        draw_loading();
+    }
     if c.editor.open {
         let names = String::from_utf8_lossy(c.editor.name.as_bytes()).to_string();
         let paths = String::from_utf8_lossy(c.editor.path.as_bytes()).to_string();
@@ -634,69 +647,131 @@ fn apply_editor() {
     }
 }
 
+/// Открыть файл. Чтение и разбор идут в отдельном потоке: на сетевом диске и на
+/// больших чертежах синхронная загрузка выглядела как «программа не грузит вообще».
 fn open_path(path: &str) {
-    let c0 = ctx();
-    let p = std::path::Path::new(path);
-    // 1) файл вообще есть?
-    let data = match std::fs::read(p) {
-        Ok(d) => d,
-        Err(e) => {
-            let msg = format!("Не открывается «{}»: {} (код {})", path, e, e.raw_os_error().unwrap_or(0));
-            c0.ui.set_last(&msg);
+    {
+        let c = ctx();
+        if let Some(p) = &c.pending {
+            p.prog.cancel();
+        }
+        let p = std::path::Path::new(path);
+        if !p.exists() {
+            let msg = format!("Файл не найден: «{}»", path);
+            c.ui.set_last(&msg);
             set_flash(&msg);
             return;
         }
-    };
-    // 2) понятные причины отказа вместо «не читается»
-    if data.is_empty() {
-        let msg = "Файл пустой (0 байт)".to_string();
-        c0.ui.set_last(&msg);
-        set_flash(&msg);
-        return;
-    }
-    if data.starts_with(b"AutoCAD Binary DXF") {
-        let msg = "Это БИНАРНЫЙ DXF (AutoCAD Binary DXF). Нужно сохранить как ASCII DXF в AutoCAD".to_string();
-        c0.ui.set_last(&msg);
-        set_flash(&msg);
-        return;
-    }
-    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-        if ext.eq_ignore_ascii_case("dwg") {
-            let msg = "Это DWG, а не DXF: сохраните файл как DXF (Save As → DXF) в AutoCAD".to_string();
-            c0.ui.set_last(&msg);
-            set_flash(&msg);
-            return;
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            if ext.eq_ignore_ascii_case("dwg") {
+                let msg = "Это DWG, а не DXF: сохраните как DXF (Save As → DXF) в AutoCAD".to_string();
+                c.ui.set_last(&msg);
+                set_flash(&msg);
+                return;
+            }
         }
+        let (prog, rx) = crate::loader::spawn(path.to_string());
+        c.pending = Some(PendingLoad { prog, rx, path: path.to_string() });
+        unsafe { SetTimer(c.hwnd, TIMER_LOAD, 80, std::ptr::null()) };
+        set_flash("Загрузка… Esc — отменить");
     }
-    let mut d = Doc::with_capacity(1024);
-    if let Err(e) = crate::dxf::parse(&data, &mut d) {
-        let head: String = String::from_utf8_lossy(&data[..data.len().min(24)]).replace(['\r', '\n'], " ");
-        let msg = format!("Не разобран как DXF: {} | начало файла: «{}»", e, head);
-        c0.ui.set_last(&msg);
-        set_flash(&msg);
-        return;
-    }
-
-    d.path.push_str(path);
     let c = ctx();
-    c.doc = d;
+    unsafe { InvalidateRect(c.hwnd, std::ptr::null(), 0) };
+}
+
+/// Установить загруженный чертёж в окно. O(1) плюс настройка первого кадра.
+fn install_doc(doc: Doc, msg: String) {
+    let c = ctx();
+    let path = doc.path.clone();
+    c.doc = doc;
     c.ui.selected_text = if c.doc.texts.is_empty() { None } else { Some(0) };
-    c.ui.set_file(path);
+    c.ui.texts_scroll = 0;
+    c.ui.set_file(&path);
+    let points = c.doc.xs.len().max(64) * 2;
     c.renderer.sx.clear();
     c.renderer.sy.clear();
-    c.renderer.sx.resize(c.doc.xs.len().max(64) * 2, 0);
-    c.renderer.sy.resize(c.doc.xs.len().max(64) * 2, 0);
+    c.renderer.sx.resize(points, 0);
+    c.renderer.sy.resize(points, 0);
+    // Первый кадр большого чертежа: сразу берём шаг прореживания, иначе открытие
+    // отдаёт одно «тяжёлое» подвисание ещё до первой отрисовки.
+    let segs = c.doc.segs.len();
+    c.renderer.seg_step = if segs > 800_000 {
+        8
+    } else if segs > 200_000 {
+        4
+    } else if segs > 60_000 {
+        2
+    } else {
+        1
+    };
     let view_w = (c.renderer.fb.w as i32 - crate::render::swiss::LEFT_W - crate::render::swiss::RIGHT_W).max(32);
     let view_h = (c.renderer.fb.h as i32 - crate::render::swiss::TOP_H - crate::render::swiss::STATUS_H).max(32);
-    c.zoom = 0.0;
-    c.ui.texts_scroll = 0;
     let fit = Camera::fit(c.doc.bounds(), view_w, view_h, 64);
     c.zoom = fit.scale;
     let (x0, y0, x1, y1) = c.doc.bounds();
     c.view_center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
     c.cam = fit;
-    let msg = format!("Открыт {}: надписей {}", path, c.doc.texts.len());
+    c.ui.set_last(&msg);
     set_flash(&msg);
+}
+
+/// Число в строку без аллокаций (для экрана загрузки).
+fn num_str(mut v: u64, buf: &mut [u8; 24]) -> &str {
+    let mut tmp = [0u8; 24];
+    let mut k = 0usize;
+    if v == 0 {
+        tmp[0] = b'0';
+        k = 1;
+    }
+    while v > 0 && k < tmp.len() {
+        tmp[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        k += 1;
+    }
+    let mut n = 0usize;
+    while k > 0 {
+        k -= 1;
+        if n < buf.len() {
+            buf[n] = tmp[k];
+            n += 1;
+        }
+    }
+    std::str::from_utf8(&buf[..n]).unwrap_or("0")
+}
+
+/// Экран загрузки поверх сцены: прогресс, этап, число объектов, файл.
+fn draw_loading() {
+    let c = ctx();
+    let Some(p) = &c.pending else { return };
+    let percent = p.prog.percent();
+    let mut pc = [0u8; 8];
+    let mut pn = 0usize;
+    for &b in num_str(percent as u64, &mut [0u8; 24]).as_bytes() {
+        if pn + 1 < pc.len() {
+            pc[pn] = b;
+            pn += 1;
+        }
+    }
+    pc[pn] = b'%';
+    pn += 1;
+    let pct_s = std::str::from_utf8(&pc[..pn]).unwrap_or("0%");
+    let phase_s = if p.prog.phase() == crate::loader::PHASE_READ {
+        "чтение файла"
+    } else {
+        "разбор чертежа"
+    };
+    let mut eb = [0u8; 24];
+    let ent_s = num_str(p.prog.entities(), &mut eb);
+    let path = p.path.clone();
+    let fields = [
+        ("ПРОГРЕСС", pct_s, false),
+        ("ЭТАП", phase_s, false),
+        ("ОБЪЕКТОВ ПРОЧИТАНО", ent_s, false),
+        ("ФАЙЛ", path.as_str(), false),
+    ];
+    // Раздельные заимствования полей контекста
+    let Ctx { renderer, painter, .. } = c;
+    renderer.draw_form(painter, "ЗАГРУЗКА ЧЕРТЕЖА", "Esc — отменить загрузку", &fields, "");
 }
 
 /// Действие «ПРИНЯТЬ» — одно и то же для Enter и для кнопки мышью.
@@ -724,6 +799,57 @@ fn submit_modal() {
             }
         }
         crate::edit::Step::Idle => {}
+    }
+}
+
+/// Забрать результат фоновой загрузки. Вызывается таймером каждые 80 мс, пока
+/// загрузка идёт; окно при этом остаётся живым и перерисовывается.
+fn poll_loading(hwnd: Hwnd) {
+    let c = ctx();
+    let Some(p) = &mut c.pending else {
+        unsafe { KillTimer(hwnd, TIMER_LOAD) };
+        return;
+    };
+    match p.rx.try_recv() {
+        Ok(loaded) => {
+            unsafe { KillTimer(hwnd, TIMER_LOAD) };
+            c.pending = None;
+            match loaded.doc {
+                Ok(doc) => {
+                    let st = loaded.stats.clone();
+                    let msg = format!(
+                        "Открыт «{}»: объектов {}, блоков {}, вставок {}",
+                        loaded.path,
+                        doc.entity_count(),
+                        st.blocks,
+                        st.inserts_expanded
+                    );
+                    install_doc(doc, msg);
+                    if st.skipped > 0 || st.inserts_unresolved > 0 {
+                        let warn = format!(
+                            "Внимание: неподдержано {}, вставок без блока {}. Подробности: report",
+                            st.skipped, st.inserts_unresolved
+                        );
+                        c.ui.set_last(&warn);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Не открыт «{}»: {}", loaded.path, e);
+                    c.ui.set_last(&msg);
+                    set_flash(&msg);
+                }
+            }
+            unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            unsafe { KillTimer(hwnd, TIMER_LOAD) };
+            c.pending = None;
+            set_flash("Загрузка прервана");
+            unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+        }
     }
 }
 
@@ -864,7 +990,10 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             }
 
             // ---------- клики по форме редактора каталога (приоритет — модалка сверху)
-            if c.editor.open {
+            if c.pending.is_some() {
+        draw_loading();
+    }
+    if c.editor.open {
                 let n = 2usize;
                 for i in 0..n {
                     let fr = crate::render::form_field_rect(cw, ch, n, i);
@@ -1009,7 +1138,10 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                 let mut utf8 = Vec::with_capacity(4);
                 crate::text::cp1251_to_utf8(&[byte], &mut utf8);
                 for ch in String::from_utf8_lossy(&utf8).chars() {
-                    if c.editor.open {
+                    if c.pending.is_some() {
+        draw_loading();
+    }
+    if c.editor.open {
                         let b = if c.editor.focus == 1 { &mut c.editor.path } else { &mut c.editor.name };
                         b.insert_char(ch);
                     } else if c.session.is_busy() {
@@ -1024,7 +1156,10 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             let c = ctx();
             let ctrl = unsafe { GetKeyState(VK_CONTROL) } < 0;
             // ---------- редактор каталога перехватывает клавиши первым
-            if c.editor.open {
+            if c.pending.is_some() {
+        draw_loading();
+    }
+    if c.editor.open {
                 match wp {
                     VK_ESCAPE => {
                         c.editor.open = false;
@@ -1111,7 +1246,11 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
                     }
                 }
                 VK_ESCAPE => {
-                    if c.ui.help_open {
+                    if let Some(p) = &c.pending {
+                        p.prog.cancel();
+                        set_flash("Загрузка отменяется…");
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    } else if c.ui.help_open {
                         c.ui.help_open = false;
                         set_flash("Справка закрыта");
                     } else if c.session.is_busy() {
@@ -1181,10 +1320,17 @@ unsafe extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) ->
             }
             0
         }
-        WM_TIMER => unsafe {
-            DestroyWindow(hwnd);
-            0
-        },
+        WM_TIMER => {
+            if wp == TIMER_LOAD {
+                poll_loading(hwnd);
+                0
+            } else {
+                unsafe {
+                    DestroyWindow(hwnd);
+                    0
+                }
+            }
+        }
         WM_CLOSE => {
             unsafe {
                 DestroyWindow(hwnd);
@@ -1210,6 +1356,7 @@ pub fn run(
     selftest_ms: u32,
     cfg: AppConfig,
     cfg_path: String,
+    initial_path: Option<String>,
 ) -> i32 {
     unsafe {
         // Консольное окно в оконном режиме не нужно: exe собран как консольное
@@ -1256,6 +1403,7 @@ pub fn run(
         let mem_dc = CreateCompatibleDC(0);
         let c = Box::new(Ctx {
             cfg,
+            pending: None,
             cfg_path,
             editor: CatEditor::new(),
             doc,
@@ -1316,6 +1464,11 @@ pub fn run(
         UpdateWindow(hwnd);
         if selftest_ms > 0 {
             SetTimer(hwnd, 1, selftest_ms, std::ptr::null());
+        }
+        // Файл из аргумента грузим уже ПОСЛЕ появления окна: иначе на большом
+        // чертеже окно не появляется вовсе, и это выглядит как «не грузит».
+        if let Some(p) = initial_path {
+            open_path(&p);
         }
         let mut msg = Msg::default();
         while GetMessageA(&mut msg, 0, 0, 0) > 0 {

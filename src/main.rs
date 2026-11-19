@@ -18,6 +18,7 @@ mod dxf;
 mod edit;
 mod eml;
 mod journal;
+mod loader;
 mod pool;
 mod ports;
 mod render;
@@ -291,6 +292,7 @@ fn cmd_edit(args: &[String]) {
 }
 
 fn cmd_save(args: &[String]) {
+    let fallback = args.iter().any(|a| a == "--fallback");
     let path = args.get(1).cloned().unwrap_or_else(|| die("save: нужен путь к .dxf"));
     let cfg_path = arg_val(args, "--config");
     let cfg = load_config(cfg_path);
@@ -324,8 +326,15 @@ fn cmd_save(args: &[String]) {
     // в относительный путь (реальный баг, пойманый на живом прогоне).
     let dir = save::parent_dir(&target);
     let vdir = save::join(&dir, &cfg.versions_dir);
-    fs.create_dir_all(&vdir).unwrap_or_else(|e| die(&format!("каталог версий {}: {}", vdir, e)));
-    let index_path = save::join(&vdir, "index.tsv");
+    let vdir_ok = fs.create_dir_all(&vdir).is_ok();
+    let index_path = if vdir_ok {
+        save::join(&vdir, "index.tsv")
+    } else {
+        // Каталог версий недоступен: цепочку ведём в локальном кэше, чтобы протокол
+        // дошёл до проверки прав в save() и сказал человеку точную причину.
+        let tmp = std::env::var("TEMP").unwrap_or_else(|_| ".".to_string());
+        save::join(&save::join(&tmp, "dxfsign"), "index.tsv")
+    };
     let mut store = ports::ChainStore::open(index_path).unwrap_or_else(|e| die(&format!("цепочка: {}", e)));
     let seq: u64 = arg_val(args, "--seq").and_then(|v| v.parse().ok()).unwrap_or(store.count() + 1);
 
@@ -355,6 +364,38 @@ fn cmd_save(args: &[String]) {
             let _ = std::fs::remove_file(&jpath);
         }
         Err(save::SaveError::NothingChanged) => println!("чертёж не изменился: версия и письмо не создавались"),
+        Err(e) if e.is_access() && fallback => {
+            // Нет прав на сетевом диске: сохраняем рядом с профилем, чтобы правка
+            // не пропала, и говорим точный путь.
+            let outbox = local_outbox();
+            let mut fb = ports::LocalFs::new();
+            let _ = fb.create_dir_all(&outbox);
+            let fvdir = save::join(&outbox, "_VERSIONS");
+            let _ = fb.create_dir_all(&fvdir);
+            let file = target.rsplit(['\\', '/']).next().unwrap_or("drawing.dxf").to_string();
+            let ftarget = save::join(&outbox, &file);
+            let fcfg = save::SaveConfig {
+                spool_dir: save::join(&outbox, "_SPOOL"),
+                versions_dir: "_VERSIONS".to_string(),
+                ..scfg.clone()
+            };
+            let mut fm = ports::SpoolTransport::new(fcfg.spool_dir.clone());
+            let mut fstore = match ports::ChainStore::open(save::join(&fvdir, "index.tsv")) {
+                Ok(s) => s,
+                Err(err) => die(&format!("{} | резервная цепочка: {}", e, err)),
+            };
+            let fseq = fstore.count() + 1;
+            let mut fb2 = Vec::with_capacity(1 << 20);
+            match save::save_to(&d, &fcfg, &mut fb, &mut signer_box, &mut fm, &mut fstore, now, fseq, &mut fb2, Some(&ftarget)) {
+                Ok(o) => {
+                    println!("ВНИМАНИЕ: {}", e);
+                    println!("правка сохранена в резервное место: {}", ftarget);
+                    println!("перечень: {} · письмо: {}", o.txt_path, o.eml_path);
+                    let _ = std::fs::remove_file(&jpath);
+                }
+                Err(e2) => die(&format!("{} | резервное сохранение тоже не удалось: {}", e, e2)),
+            }
+        }
         Err(e) => die(&format!("сохранение не выполнено: {}", e)),
     }
 }
@@ -641,17 +682,7 @@ fn window_save(doc: &doc::Doc, cfg: &config::AppConfig) -> String {
         return "Нет правок в этой сессии: сохранять нечего".to_string();
     }
     let mut fs = ports::LocalFs::new();
-    let dir = save::parent_dir(&doc.path);
-    let vdir = save::join(&dir, &cfg.versions_dir);
-    if let Err(e) = fs.create_dir_all(&vdir) {
-        return format!("Каталог версий {}: {}", vdir, e);
-    }
-    let index_path = save::join(&vdir, "index.tsv");
-    let mut store = match ports::ChainStore::open(index_path) {
-        Ok(s) => s,
-        Err(e) => return format!("Цепочка версий: {}", e),
-    };
-    let seq = store.count() + 1;
+    let scfg = save_config(cfg);
     let key = cfg.load_key();
     let mut signer = if key.is_empty() {
         ports::HmacSigner::unavailable(cfg.key_id.clone())
@@ -659,9 +690,17 @@ fn window_save(doc: &doc::Doc, cfg: &config::AppConfig) -> String {
         ports::HmacSigner::new(key, cfg.key_id.clone())
     };
     let mut mail = ports::SpoolTransport::new(cfg.spool_dir.clone());
-    let scfg = save_config(&cfg);
+    let dir = save::parent_dir(&doc.path);
+    let vdir = save::join(&dir, &cfg.versions_dir);
+    let index_path = save::join(&vdir, "index.tsv");
+    let _ = fs.create_dir_all(&vdir);
+    let mut store = match ports::ChainStore::open(index_path.clone()) {
+        Ok(s) => s,
+        Err(_) => return format!("Не удалось открыть цепочку версий: {}", index_path),
+    };
+    let seq = store.count() + 1;
     let mut bytes = Vec::with_capacity(1 << 20);
-    match save::save(doc, &scfg, &mut fs, &mut signer, &mut mail, &mut store, now_unix(), seq, &mut bytes) {
+    match save::save(&doc, &scfg, &mut fs, &mut signer, &mut mail, &mut store, now_unix(), seq, &mut bytes) {
         Ok(o) => format!(
             "Сохранено: правок {}, провод {}. Старая версия -> {}",
             o.edits,
@@ -669,8 +708,45 @@ fn window_save(doc: &doc::Doc, cfg: &config::AppConfig) -> String {
             if o.version_file.is_empty() { "—" } else { &o.version_file }
         ),
         Err(save::SaveError::NothingChanged) => "Чертёж не изменился: версия не пишется".to_string(),
+        Err(e) if e.is_access() => {
+            // Работа не должна пропадать из-за прав: пишем в локальный outbox.
+            let outbox = local_outbox();
+            let name = save::parent_dir(&doc.path);
+            let _ = name;
+            let file = doc.path.rsplit(['\\', '/']).next().unwrap_or("drawing.dxf").to_string();
+            let target = save::join(&outbox, &file);
+            let mut fb = ports::LocalFs::new();
+            let _ = fb.create_dir_all(&outbox);
+            let fcfg = save::SaveConfig {
+                spool_dir: save::join(&outbox, "_SPOOL"),
+                versions_dir: "_VERSIONS".to_string(),
+                ..scfg.clone()
+            };
+            let findex = save::join(&outbox, "_VERSIONS");
+            let _ = fb.create_dir_all(&findex);
+            let mut fstore = match ports::ChainStore::open(save::join(&findex, "index.tsv")) {
+                Ok(s) => s,
+                Err(_) => return format!("Не сохранено: {}", e),
+            };
+            let fseq = fstore.count() + 1;
+            let mut fmail = ports::SpoolTransport::new(fcfg.spool_dir.clone());
+            let mut fbytes = Vec::with_capacity(1 << 20);
+            match save::save_to(&doc, &fcfg, &mut fb, &mut signer, &mut fmail, &mut fstore, now_unix(), fseq, &mut fbytes, Some(&target)) {
+                Ok(o) => format!(
+                    "{} | Сохранено в резервное место: {} (перечень: {}). Перенесите файл на диск вручную.",
+                    e, target, o.txt_path
+                ),
+                Err(e2) => format!("{} | Резервное сохранение тоже не удалось: {}", e, e2),
+            }
+        }
         Err(e) => format!("Не сохранено: {}", e),
     }
+}
+
+/// Локальный каталог для сохранения, когда на сетевом диске нет прав.
+fn local_outbox() -> String {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    save::join(&save::join(&base, "dxfsign"), "outbox")
 }
 
 #[cfg(windows)]
@@ -701,7 +777,13 @@ fn cmd_open(args: &[String]) -> i32 {
     } else {
         load_config(Some(cfg_path.clone()))
     };
-    window::run(d, 1440, 900, &title, Some(window_save), selftest, cfg, cfg_path)
+    // Если путь задан — отдаём его окну для фоновой загрузки, а не читаем здесь.
+    let initial = if d.path.is_empty() { None } else { Some(d.path.clone()) };
+    if initial.is_some() {
+        d = demo_doc();
+        d.path.clear();
+    }
+    window::run(d, 1440, 900, &title, Some(window_save), selftest, cfg, cfg_path, initial)
 }
 
 /// Для демо-чертежа путь пуст; чтобы Ctrl+S не упирался в пустоту, при первом

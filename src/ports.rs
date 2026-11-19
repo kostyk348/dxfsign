@@ -22,6 +22,34 @@ pub struct DirEntryRec {
 }
 
 /// Источник файлов. Реализации: локальный/сетевой путь (UNC), память (тесты).
+/// Проверка прав: пишем пробный файл. Без неё первая же ошибка возникает уже в
+/// середине протокола сохранения, и человек видит только «os error 5».
+pub fn probe_writable(fs: &mut dyn FileSource, dir: &str) -> Result<(), String> {
+    let probe = format!("{}\\.dxfsign-write-test-{}", dir.trim_end_matches(['\\', '/']), std::process::id());
+    match fs.write_atomic(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs.remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(format!("в каталоге «{}» {}", dir, describe_io(&e))),
+    }
+}
+
+/// Человеческое описание ошибок ввода-вывода Windows. `os error 5` само по себе
+/// ничего не говорит о том, что делать.
+pub fn describe_io(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(5) => "отказано в доступе (нет прав на папку или файл помечен «только чтение»)".to_string(),
+        Some(32) => "файл занят другой программой (закройте его в AutoCAD и повторите)".to_string(),
+        Some(2) => "путь не найден (проверьте, что сетевой диск подключён)".to_string(),
+        Some(3) => "путь не найден".to_string(),
+        Some(19) => "диск защищён от записи".to_string(),
+        Some(112) => "на диске нет места".to_string(),
+        Some(123) => "недопустимое имя файла".to_string(),
+        _ => e.to_string(),
+    }
+}
+
 pub trait FileSource {
     fn read(&self, path: &str) -> io::Result<Vec<u8>>;
     fn exists(&self, path: &str) -> bool;

@@ -53,13 +53,29 @@ impl Default for SaveConfig {
 #[derive(Debug)]
 pub enum SaveError {
     Io(String),
+    /// Нет прав на запись. Владелец должен видеть, куда именно и почему.
+    AccessDenied { path: String, hint: String },
     NothingChanged,
+}
+
+impl SaveError {
+    /// Ошибка, при которой имеет смысл предложить сохранить в другое место.
+    pub fn is_access(&self) -> bool {
+        matches!(self, SaveError::AccessDenied { .. })
+    }
 }
 
 impl std::fmt::Display for SaveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SaveError::Io(s) => write!(f, "{}", s),
+            SaveError::AccessDenied { path, hint } => {
+                if hint.contains(path.as_str()) {
+                    write!(f, "отказано в доступе: {}", hint)
+                } else {
+                    write!(f, "отказано в доступе: {} — {}", path, hint)
+                }
+            }
             SaveError::NothingChanged => write!(f, "чертёж не менялся: версия не пишется"),
         }
     }
@@ -273,6 +289,25 @@ pub fn save(
     seq: u64,
     dxf_bytes: &mut Vec<u8>,
 ) -> Result<SaveOutcome, SaveError> {
+    save_to(doc, cfg, fs, signer, mail, store, unix_secs, seq, dxf_bytes, None)
+}
+
+/// То же сохранение, но рабочий файл — `forced_target` (когда в родной каталог
+/// писать нельзя: нет прав, файл read-only, сетевой диск недоступен).
+#[allow(clippy::too_many_arguments)]
+pub fn save_to(
+    doc: &Doc,
+    cfg: &SaveConfig,
+    fs: &mut dyn FileSource,
+    signer: &dyn Signer,
+    mail: &mut dyn MailTransport,
+    store: &mut dyn VersionStore,
+    unix_secs: i64,
+    seq: u64,
+    dxf_bytes: &mut Vec<u8>,
+    forced_target: Option<&str>,
+) -> Result<SaveOutcome, SaveError> {
+    let doc_path: String = forced_target.map(|s| s.to_string()).unwrap_or_else(|| doc.path.clone());
     // ---- шаг 1: новые байты и их хеш
     let _lost = crate::dxf::write(doc, dxf_bytes);
     let new_hash = sha256(dxf_bytes);
@@ -283,8 +318,8 @@ pub fn save(
     hex(&new_hash, &mut out.new_hex);
 
     // ---- шаг 2: прежняя версия -> подпапка версий
-    let prev = if fs.exists(&doc.path) {
-        Some(fs.read(&doc.path).map_err(|e| SaveError::Io(e.to_string()))?)
+    let prev = if fs.exists(&doc_path) {
+        Some(fs.read(&doc_path).map_err(|e| SaveError::Io(e.to_string()))?)
     } else {
         None
     };
@@ -300,13 +335,35 @@ pub fn save(
         return Err(SaveError::NothingChanged);
     }
 
-    let dir = parent_dir(&doc.path);
+    let dir = parent_dir(&doc_path);
     let vdir = join(&dir, &cfg.versions_dir);
+    // Права проверяем ДО первой записи: иначе человек получает «os error 5» уже
+    // после того, как часть протокола отработала.
+    if fs.exists(&dir) {
+        crate::ports::probe_writable(fs, &dir).map_err(|hint| SaveError::AccessDenied { path: dir.clone(), hint })?;
+    } else {
+        return Err(SaveError::Io(format!("каталог чертежа не найден: {}", dir)));
+    }
+    // файл может быть помечен «только чтение» — это тоже error 5
+    if let Ok(md) = std::fs::metadata(&doc_path) {
+        if md.permissions().readonly() {
+            return Err(SaveError::AccessDenied {
+                path: doc_path.clone(),
+                hint: "файл помечен «только чтение»: снимите атрибут или сохраните через «Сохранить как»".to_string(),
+            });
+        }
+    }
     if let Some(pb) = &prev {
-        fs.create_dir_all(&vdir).map_err(|e| SaveError::Io(e.to_string()))?;
+        fs.create_dir_all(&vdir).map_err(|e| {
+        if e.raw_os_error() == Some(5) {
+            SaveError::AccessDenied { path: vdir.clone(), hint: crate::ports::describe_io(&e) }
+        } else {
+            SaveError::Io(format!("каталог версий «{}»: {}", vdir, crate::ports::describe_io(&e)))
+        }
+    })?;
         let vname = format!(
             "{}__{}_{:03}.dxf",
-            file_stem(&doc.path),
+            file_stem(&doc_path),
             stamp_compact(unix_secs, cfg.tz_offset_min),
             seq
         );
@@ -325,14 +382,14 @@ pub fn save(
     }
 
     // ---- шаг 3: перезапись рабочего файла
-    fs.write_atomic(&doc.path, dxf_bytes)
-        .map_err(|e| SaveError::Io(e.to_string()))?;
+    fs.write_atomic(&doc_path, dxf_bytes)
+        .map_err(|e| SaveError::Io(format!("запись «{}»: {}", doc_path, crate::ports::describe_io(&e))))?;
     out.written = true;
 
     // ---- шаг 4a: .txt рядом с чертежом
     let txt_name = format!(
         "{}__{}.changes.txt",
-        file_stem(&doc.path),
+        file_stem(&doc_path),
         stamp_compact(unix_secs, cfg.tz_offset_min)
     );
     let txt_path = join(&dir, &txt_name);
@@ -354,7 +411,7 @@ pub fn save(
     out.wires = wires.clone();
     let comments = collect_comments(&doc.log.entries, doc);
     let canon = eml::canonical(
-        &doc.path,
+        &doc_path,
         &out.new_hex,
         &out.prev_hex,
         &out.version_file,
@@ -364,7 +421,7 @@ pub fn save(
     );
     let sig = signer.sign(canon.as_bytes());
     let mut x_headers: Vec<(String, String)> = Vec::with_capacity(10);
-    x_headers.push(("X-DXFSIGN-Working-File".into(), doc.path.clone()));
+    x_headers.push(("X-DXFSIGN-Working-File".into(), doc_path.clone()));
     x_headers.push(("X-DXFSIGN-New-SHA256".into(), out.new_hex.clone()));
     x_headers.push(("X-DXFSIGN-Prev-SHA256".into(), out.prev_hex.clone()));
     x_headers.push(("X-DXFSIGN-Prev-Version".into(), out.version_file.clone()));
@@ -394,7 +451,7 @@ pub fn save(
 
     let subject = format!(
         "[DXFSIGN] {} — правок: {} — провод: {}",
-        file_stem(&doc.path),
+        file_stem(&doc_path),
         out.edits,
         if wires.is_empty() { "—".to_string() } else { wires.clone() }
     );
@@ -406,7 +463,7 @@ pub fn save(
         message_id: eml::message_id(unix_secs, seq),
         body_text: format!(
             "Сохранение чертежа.\n\nФайл: {}\nПравок: {}\nНомера проводов: {}\nКомментарии: {}\nПрежняя версия: {}\nПеречень изменений: {}\n\nФайлы во вложении: новый .dxf, прежний .dxf, перечень .txt.\n",
-            doc.path,
+            doc_path,
             out.edits,
             if wires.is_empty() { "—".to_string() } else { wires.clone() },
             if comments.is_empty() { "—".to_string() } else { comments.clone() },
@@ -417,12 +474,12 @@ pub fn save(
     };
     let atts = vec![
         Attachment {
-            filename: format!("{}.dxf", file_stem(&doc.path)),
+            filename: format!("{}.dxf", file_stem(&doc_path)),
             mime: "application/octet-stream",
             data: dxf_bytes.as_slice(),
         },
         Attachment {
-            filename: format!("prev__{}.dxf", file_stem(&doc.path)),
+            filename: format!("prev__{}.dxf", file_stem(&doc_path)),
             mime: "application/octet-stream",
             data: prev.as_deref().unwrap_or(&[]),
         },
@@ -436,7 +493,7 @@ pub fn save(
     eml::build(&meta, &atts, seq ^ (unix_secs as u64), &mut raw);
     let eml_name = format!(
         "{}__{}.eml",
-        file_stem(&doc.path),
+        file_stem(&doc_path),
         stamp_compact(unix_secs, cfg.tz_offset_min)
     );
     let eml_path = mail
@@ -453,7 +510,7 @@ pub fn save(
     let rec = VersionRecord {
         seq,
         unix_secs,
-        working_file: doc.path.clone(),
+        working_file: doc_path.clone(),
         version_file: out.version_file.clone(),
         new_hash,
         prev_hash: prev_hash.unwrap_or([0u8; 32]),

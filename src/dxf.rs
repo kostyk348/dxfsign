@@ -25,6 +25,8 @@ use crate::text::{cp1251_to_utf8, utf8_to_cp1251};
 #[derive(Debug)]
 pub enum DxfError {
     NotDxf,
+    /// Разбор прерван пользователем (Esc во время загрузки).
+    Cancelled,
     Eof,
     BadCode { line: usize },
     Unsupported(String),
@@ -35,6 +37,7 @@ impl std::fmt::Display for DxfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DxfError::NotDxf => write!(f, "файл не похож на ASCII DXF"),
+            DxfError::Cancelled => write!(f, "разбор отменён"),
             DxfError::Eof => write!(f, "неожиданный конец файла DXF"),
             DxfError::BadCode { line } => write!(f, "строка {}: не разобран group code", line),
             DxfError::Unsupported(s) => write!(f, "неподдерживаемая сущность DXF: {}", s),
@@ -56,6 +59,11 @@ struct TagReader<'a> {
 impl<'a> TagReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0, line: 0 }
+    }
+
+    /// Текущая позиция в файле — для прогресса загрузки.
+    fn position(&self) -> usize {
+        self.pos
     }
 
     fn read_line(&mut self) -> Option<&'a [u8]> {
@@ -251,13 +259,16 @@ pub struct ParseStats {
 }
 
 impl ParseStats {
+    /// Счётчик по типу. Сравнение по байтам, без `String` на каждый вызов: на
+    /// чертеже с миллионом сущностей аллокация в счётчике — это миллион malloc.
     pub fn bump(&mut self, kind: &[u8]) {
-        let name = String::from_utf8_lossy(kind).to_string();
-        if let Some(e) = self.by_type.iter_mut().find(|(k, _)| *k == name) {
-            e.1 += 1;
-        } else {
-            self.by_type.push((name, 1));
+        for e in self.by_type.iter_mut() {
+            if e.0.as_bytes() == kind {
+                e.1 += 1;
+                return;
+            }
         }
+        self.by_type.push((String::from_utf8_lossy(kind).to_string(), 1));
     }
     pub fn summary(&self) -> String {
         let mut v: Vec<&(String, usize)> = self.by_type.iter().collect();
@@ -806,6 +817,18 @@ fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
 /// Не поддержано (считается в статистике): `HATCH`, `DIMENSION`, `LEADER`,
 /// `MLINE`, `XREF`. Они не теряются молча — попадают в `by_type`.
 pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
+    let mut stats = ParseStats::default();
+    parse_with(data, doc, None, &mut stats)
+}
+
+/// Разбор с прогрессом и отменой. Проверка отмены — раз в 8192 тега: чаще нет
+/// смысла (одна сущность парсится микросекунды), реже — отклик станет заметным.
+pub fn parse_with(
+    data: &[u8],
+    doc: &mut Doc,
+    prog: Option<&crate::loader::Progress>,
+    stats_out: &mut ParseStats,
+) -> Result<ParseStats> {
     doc.clear();
     let mut stats = ParseStats::default();
     if data.len() < 8 {
@@ -842,11 +865,22 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
         pts.clear();
     }
 
+    let mut tags_seen: u64 = 0u64;
     loop {
         let (code, val) = match r.next_tag() {
             Some(t) => t,
             None => break,
         };
+        tags_seen += 1;
+        if tags_seen & 0x1FFF == 0 {
+            if let Some(p) = prog {
+                if p.cancelled() {
+                    return Err(DxfError::Cancelled);
+                }
+                p.done.store(r.position() as u64, std::sync::atomic::Ordering::Relaxed);
+                p.entities.store(stats.total_entities as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let val_t = trim(val);
         if code == 0 {
             let name = val_t;
@@ -1039,6 +1073,7 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
     if !saw_acadver && doc.dxf_version.is_empty() && stats.total_entities == 0 && doc.layers.is_empty() && doc.texts.is_empty() {
         return Err(DxfError::NotDxf);
     }
+    *stats_out = stats.clone();
     Ok(stats)
 }
 
