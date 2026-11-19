@@ -773,6 +773,53 @@ fn local_outbox() -> String {
 }
 
 #[cfg(windows)]
+/// probe: прочитать файл и показать скорость/зависания. Нужен, когда «висит» —
+/// вывод показывает, на каком проценте чтение перестало двигаться.
+fn cmd_probe(args: &[String]) -> i32 {
+    let path = args.get(1).cloned().unwrap_or_else(|| die("probe: нужен путь к файлу"));
+    let cloud = loader::is_cloud_placeholder(&path);
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    println!("файл:  {}", path);
+    println!("размер: {:.1} МБ{}", size as f64 / 1_048_576.0, if cloud { " · облачная заготовка (данные не на диске)" } else { "" });
+    // Окно без интерфейса: только чтение, с прогрессом в консоль.
+    let (prog, rx) = loader::spawn(path.clone());
+    let t0 = std::time::Instant::now();
+    let mut last = 0u64;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(loaded) => {
+                let dt = t0.elapsed().as_secs_f64();
+                match loaded.doc {
+                    Ok(d) => {
+                        let st = loaded.stats;
+                        println!(
+                            "прочитано и разобрано: {:.2} с, объекты: {}, вставок: {}, слоёв: {}",
+                            dt, d.entity_count(), st.inserts_expanded, d.layers.len()
+                        );
+                    }
+                    Err(e) => {
+                        println!("не прочитан за {:.2} с: {}", dt, e);
+                        return 2;
+                    }
+                }
+                return 0;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let d = prog.done();
+                let pct = prog.percent();
+                let phase = if prog.phase() == loader::PHASE_READ { "чтение" } else { "разбор" };
+                if d != last {
+                    println!("  {}: {}% ({:.1} МБ, {:.1} МБ/с)", phase, pct, d as f64 / 1_048_576.0, prog.rate() as f64 / 1_048_576.0);
+                    last = d;
+                } else if prog.phase() == loader::PHASE_READ {
+                    println!("  {}: {}% — данных нет {:.0} с (считается зависанием через {} с)", phase, pct, t0.elapsed().as_secs_f64(), loader::STALL.as_secs());
+                }
+            }
+            Err(_) => return 2,
+        }
+    }
+}
+
 fn cmd_open(args: &[String]) -> i32 {
     let selftest: u32 = arg_val(args, "--selftest").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut d = match args.get(1) {
@@ -873,7 +920,7 @@ fn main() {
         std::process::exit(run_default_mode());
     }
     // `dxfsign.exe C:\path\file.dxf` (двойной клик по файлу, ассоциация) — сразу окно
-    if !args[1].starts_with('-') && !matches!(args[1].as_str(), "inspect" | "report" | "edit" | "save" | "snapshot" | "bench" | "alloc" | "frame-bench" | "catalog" | "open" | "help") {
+    if !args[1].starts_with('-') && !matches!(args[1].as_str(), "inspect" | "report" | "edit" | "save" | "snapshot" | "probe" | "bench" | "alloc" | "frame-bench" | "catalog" | "open" | "help") {
         let mut a: Vec<String> = vec!["open".to_string()];
         a.extend_from_slice(&args[1..]);
         std::process::exit(run_open_mode(&a));
@@ -889,6 +936,9 @@ fn main() {
         "edit" => cmd_edit(&args[1..]),
         "save" => cmd_save(&args[1..]),
         "snapshot" => cmd_snapshot(&args[1..]),
+        "probe" => {
+            std::process::exit(cmd_probe(&args[1..]));
+        }
         "bench" => cmd_bench(&args[1..]),
         "alloc" => cmd_alloc(&args[1..]),
         "frame-bench" => cmd_frame_bench(&args[1..]),

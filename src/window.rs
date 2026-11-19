@@ -277,6 +277,8 @@ struct PendingLoad {
     prog: crate::loader::Progress,
     rx: std::sync::mpsc::Receiver<crate::loader::Loaded>,
     path: String,
+    /// Момент старта: без него «медленно» и «висит» не различить.
+    started: std::time::Instant,
 }
 
 struct Ctx {
@@ -671,7 +673,12 @@ fn open_path(path: &str) {
             }
         }
         let (prog, rx) = crate::loader::spawn(path.to_string());
-        c.pending = Some(PendingLoad { prog, rx, path: path.to_string() });
+        c.pending = Some(PendingLoad {
+            prog,
+            rx,
+            path: path.to_string(),
+            started: std::time::Instant::now(),
+        });
         unsafe { SetTimer(c.hwnd, TIMER_LOAD, 80, std::ptr::null()) };
         set_flash("Загрузка… Esc — отменить");
     }
@@ -739,39 +746,86 @@ fn num_str(mut v: u64, buf: &mut [u8; 24]) -> &str {
     std::str::from_utf8(&buf[..n]).unwrap_or("0")
 }
 
-/// Экран загрузки поверх сцены: прогресс, этап, число объектов, файл.
+/// Экран загрузки поверх сцены: прогресс, этап, скорость, оценка остатка, файл.
+///
+/// Скорость и остаток показываются намеренно: без них «медленно тянет по сети»
+/// и «зависло» выглядят одинаково.
 fn draw_loading() {
     let c = ctx();
     let Some(p) = &c.pending else { return };
     let percent = p.prog.percent();
-    let mut pc = [0u8; 8];
-    let mut pn = 0usize;
-    for &b in num_str(percent as u64, &mut [0u8; 24]).as_bytes() {
-        if pn + 1 < pc.len() {
-            pc[pn] = b;
-            pn += 1;
-        }
-    }
-    pc[pn] = b'%';
-    pn += 1;
-    let pct_s = std::str::from_utf8(&pc[..pn]).unwrap_or("0%");
-    let phase_s = if p.prog.phase() == crate::loader::PHASE_READ {
-        "чтение файла"
-    } else {
-        "разбор чертежа"
+    let mut pc = [0u8; 32];
+    let pct_s = {
+        let n = copy_str(&mut pc, num_str(percent as u64, &mut [0u8; 24]));
+        pc[n] = b'%';
+        std::str::from_utf8(&pc[..n + 1]).unwrap_or("0%")
     };
-    let mut eb = [0u8; 24];
-    let ent_s = num_str(p.prog.entities(), &mut eb);
+    let phase_s = match p.prog.phase() {
+        crate::loader::PHASE_READ => "чтение файла",
+        _ => "разбор чертежа",
+    };
+    // скорость и остаток — только на чтении, где они осмысленны
+    let mut sb = [0u8; 64];
+    let speed_s = if p.prog.phase() == crate::loader::PHASE_READ {
+        let bps = p.prog.rate();
+        let total = p.prog.total().max(1);
+        let done = p.prog.done();
+        let mut n = copy_str(&mut sb, "прошло ");
+        n += copy_str(&mut sb[n..], num_str(p.started.elapsed().as_secs(), &mut [0u8; 24]));
+        n += copy_str(&mut sb[n..], " с · ");
+        if bps > 0 {
+            n = copy_str(&mut sb, num_str((bps / 1024).max(1), &mut [0u8; 24]));
+            n += copy_str(&mut sb[n..], " КБ/с");
+            let left = total.saturating_sub(done);
+            let secs = left / bps.max(1);
+            n += copy_str(&mut sb[n..], " · осталось ~");
+            n += copy_str(&mut sb[n..], num_str(secs, &mut [0u8; 24]));
+            n += copy_str(&mut sb[n..], " с");
+            std::str::from_utf8(&sb[..n.min(sb.len())]).unwrap_or("")
+        } else {
+            let mut t = copy_str(&mut sb, "прошло ");
+            t += copy_str(&mut sb[t..], num_str(p.started.elapsed().as_secs(), &mut [0u8; 24]));
+            t += copy_str(&mut sb[t..], " с · ожидание данных…");
+            std::str::from_utf8(&sb[..t.min(sb.len())]).unwrap_or("")
+        }
+    } else {
+        let mut eb = [0u8; 24];
+        let e = num_str(p.prog.entities(), &mut eb);
+        let mut n = copy_str(&mut sb, "объектов: ");
+        n += copy_str(&mut sb[n..], e);
+        std::str::from_utf8(&sb[..n.min(sb.len())]).unwrap_or("")
+    };
+    let mut mb = [0u8; 64];
+    let mb_s = {
+        let mut n = copy_str(&mut mb, num_str(p.prog.done() / 1_048_576, &mut [0u8; 24]));
+        n += copy_str(&mut mb[n..], " / ");
+        n += copy_str(&mut mb[n..], num_str(p.prog.total() / 1_048_576, &mut [0u8; 24]));
+        n += copy_str(&mut mb[n..], " МБ");
+        std::str::from_utf8(&mb[..n.min(mb.len())]).unwrap_or("")
+    };
     let path = p.path.clone();
     let fields = [
         ("ПРОГРЕСС", pct_s, false),
         ("ЭТАП", phase_s, false),
-        ("ОБЪЕКТОВ ПРОЧИТАНО", ent_s, false),
+        ("ПРОЧИТАНО", mb_s, false),
+        ("ХОД", speed_s, false),
         ("ФАЙЛ", path.as_str(), false),
     ];
-    // Раздельные заимствования полей контекста
+    let hint = if p.prog.cloud() {
+        "Облачный файл (OneDrive/Яндекс.Диск): первое чтение ждёт скачивания — Esc отменяет"
+    } else {
+        "Esc — отменить загрузку"
+    };
     let Ctx { renderer, painter, .. } = c;
-    renderer.draw_form(painter, "ЗАГРУЗКА ЧЕРТЕЖА", "Esc — отменить загрузку", &fields, "");
+    renderer.draw_form(painter, "ЗАГРУЗКА ЧЕРТЕЖА", hint, &fields, "");
+}
+
+/// Скопировать строку в буфер, вернуть длину. Без аллокаций — вызывается в кадре.
+fn copy_str(dst: &mut [u8], s: &str) -> usize {
+    let b = s.as_bytes();
+    let n = b.len().min(dst.len());
+    dst[..n].copy_from_slice(&b[..n]);
+    n
 }
 
 /// Действие «ПРИНЯТЬ» — одно и то же для Enter и для кнопки мышью.

@@ -114,6 +114,7 @@ Panels = \\srv\\projects\\panels
 | `file opened in another program (usually AutoCAD)` | The drawing is open in AutoCAD. While the file is locked **no version is created** — close the drawing and retry, then both version and mail appear. |
 | A timestamped version appeared but the drawing is unchanged | Behaviour of 1.0.4 and earlier; 1.0.5 checks the lock before rotating. |
 | The spool folder never appears | A relative `spool_dir` used to resolve against the launch directory. Now it resolves against the drawing folder; set your own with `F5` or `spool_dir` in the INI. |
+| "Stuck reading at 66%" | Reading runs on its own thread: `Esc` cancels immediately, and after 15 s without data a message lists the real causes (antivirus scanning, a OneDrive/cloud placeholder, a busy or disconnected disk). Diagnose with `dxfsign.exe probe file.dxf`, which prints percent and throughput. |
 | Slow to open / appears frozen | Reading and parsing now run on a worker thread: the window shows up immediately with stage, percent and entity count, `Esc` cancels. Files over 1.5 GB or over 4 M expanded entities are reported instead of hanging. |
 | Nothing is drawn but the status shows entities | The file contains only unsupported types (`HATCH`, `DIMENSION`, `LEADER`, `XREF`) — counted in `report`, not drawn. |
 | Cyrillic text looks garbled | A legacy file was classified as UTF-8 or vice versa. `dxfsign.exe report file.dxf` prints `$ACADVER`. |
