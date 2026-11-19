@@ -1,10 +1,12 @@
 [package]
 name = "dxfsign"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 rust-version = "1.77"
 description = "DXF viewer/editor for a network drive: every save is signed and mailed as .eml, with a .txt change list"
 license = "MIT OR Apache-2.0"
+keywords = ["dxf", "cad", "win32", "eml", "hmac"]
+categories = ["command-line-utilities", "gui"]
 
 # Ноль зависимостей — осознанно: сборка на Win7-таргете (Tier 3, -Z build-std)
 # не должна тянуть crates.io-граф, который сам может требовать Win10 APIs.

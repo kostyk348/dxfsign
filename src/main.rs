@@ -466,6 +466,37 @@ fn cmd_bench(args: &[String]) {
     }
 }
 
+/// Замер кадра: сколько миллисекунд уходит на отрисовку вида. Нужен, чтобы
+/// «тормозит/зависло» обсуждалось числом, а не ощущением.
+fn cmd_frame_bench(args: &[String]) {
+    let path = args.get(1).cloned().unwrap_or_else(|| die("frame-bench: нужен путь к .dxf"));
+    let frames: usize = arg_val(args, "--frames").and_then(|v| v.parse().ok()).unwrap_or(20);
+    let (d, st) = load_doc(&path);
+    let mut r = render::Renderer::new(1600, 1000, d.xs.len().max(16) * 2);
+    let mut ui = render::UiState::new();
+    ui.set_file(&path);
+    ui.set_status("frame-bench");
+    let view_w = 1600 - render::swiss::LEFT_W - render::swiss::RIGHT_W;
+    let view_h = 1000 - render::swiss::TOP_H - render::swiss::STATUS_H;
+    let cam = render::Camera::fit(d.bounds(), view_w, view_h, 64);
+    let session = edit::EditSession::new();
+    let mut painter = win32::ApproxPainter;
+    let _ = r.frame(&d, cam, &mut ui, &session, &mut painter);
+    let t0 = std::time::Instant::now();
+    for _ in 0..frames {
+        let _ = r.frame(&d, cam, &mut ui, &session, &mut painter);
+    }
+    let per = t0.elapsed().as_secs_f64() / frames as f64;
+    println!("сущностей: {} (типов: {}) · надписей: {}", d.entity_count(), st.summary(), d.texts.len());
+    println!("кадр: {:.2} мс ({} кадров) · нарисовано надписей: {} (бюджет {})",
+        per * 1e3, frames, r.texts_drawn, r.text_budget);
+    if per > 0.016 {
+        println!("вывод: медленнее 16 мс — при таком темпе интерфейс ощущается вязким");
+    } else {
+        println!("вывод: кадр укладывается в 16 мс (60 fps)");
+    }
+}
+
 fn cmd_alloc(args: &[String]) {
     let path = args.get(1).cloned().unwrap_or_else(|| die("alloc: нужен путь к .dxf"));
     let frames: usize = arg_val(args, "--frames").and_then(|v| v.parse().ok()).unwrap_or(50);
@@ -737,7 +768,7 @@ fn main() {
         std::process::exit(run_default_mode());
     }
     // `dxfsign.exe C:\path\file.dxf` (двойной клик по файлу, ассоциация) — сразу окно
-    if !args[1].starts_with('-') && !matches!(args[1].as_str(), "inspect" | "report" | "edit" | "save" | "snapshot" | "bench" | "alloc" | "catalog" | "open" | "help") {
+    if !args[1].starts_with('-') && !matches!(args[1].as_str(), "inspect" | "report" | "edit" | "save" | "snapshot" | "bench" | "alloc" | "frame-bench" | "catalog" | "open" | "help") {
         let mut a: Vec<String> = vec!["open".to_string()];
         a.extend_from_slice(&args[1..]);
         std::process::exit(run_open_mode(&a));
@@ -755,6 +786,7 @@ fn main() {
         "snapshot" => cmd_snapshot(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
         "alloc" => cmd_alloc(&args[1..]),
+        "frame-bench" => cmd_frame_bench(&args[1..]),
         "catalog" => cmd_catalog(&args[1..]),
         "open" => std::process::exit(run_open_mode(&args[1..])),
         _ => usage(),

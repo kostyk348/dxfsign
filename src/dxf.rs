@@ -105,6 +105,15 @@ fn parse_code(s: &[u8]) -> Option<i32> {
     Some(if neg { -v } else { v })
 }
 
+/// Снять только завершающий CR: значения текста остаются как есть, включая пробелы.
+fn strip_cr(s: &[u8]) -> &[u8] {
+    let mut e = s.len();
+    while e > 0 && (s[e - 1] == b'\r' || s[e - 1] == b'\n') {
+        e -= 1;
+    }
+    &s[..e]
+}
+
 fn trim(s: &[u8]) -> &[u8] {
     let mut a = 0;
     let mut b = s.len();
@@ -318,6 +327,35 @@ impl Xform {
     }
 }
 
+/// Декодирование текста DXF. С версии AC1021 (AutoCAD 2007) DXF пишется в UTF-8;
+/// более старые файлы — в кодовой странице ANSI (для русских — CP1251).
+/// Декодировать всё как CP1251 нельзя: в UTF-8-файле кириллица превращалась в кашу
+/// («MTEXT и кириллицу не читает вообще»). Автоопределение: валидный UTF-8 с
+/// многобайтовыми символами считаем UTF-8, иначе CP1251.
+fn decode_text(bytes: &[u8], utf8_mode: bool) -> Vec<u8> {
+    let has_high = bytes.iter().any(|b| *b >= 0x80);
+    if !has_high {
+        return bytes.to_vec();
+    }
+    let valid_utf8 = std::str::from_utf8(bytes).is_ok();
+    if utf8_mode {
+        if valid_utf8 {
+            return bytes.to_vec();
+        }
+        // «UTF-8-файл», но байты не UTF-8: значит на деле кодовая страница
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        cp1251_to_utf8(bytes, &mut out);
+        return out;
+    }
+    // старый файл: но если байты уже корректный UTF-8 с многобайтовыми — доверяем ему
+    if valid_utf8 {
+        return bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    cp1251_to_utf8(bytes, &mut out);
+    out
+}
+
 /// Чистка текста DXF: `%%d` `%%c` `%%p` `%%%` и коды MTEXT (`\P`, `\~`, `\f…;`,
 /// `\H…;`, `\A…;`, `\C…;`, `\U+XXXX`). Без этого в чертеже видно `\P` и `%%c`.
 fn clean_text(src: &[u8]) -> Vec<u8> {
@@ -411,7 +449,12 @@ struct EntityBuf {
     count: i32,
     handle: u32,
     s1: Vec<u8>,
-    s3: Vec<u8>,
+    /// имя слоя (код 8) — раньше сюда же дописывались фрагменты MTEXT, из-за чего
+    /// «слой» превращался в текст, а сам текст терялся
+    layer_name: Vec<u8>,
+    /// фрагменты MTEXT до основного (код 3)
+    mtext_pre: Vec<u8>,
+    utf8_mode: bool,
     app: Vec<u8>,
     wire: Vec<u8>,
     want_wire: bool,
@@ -438,7 +481,8 @@ impl EntityBuf {
         self.count = 0;
         self.handle = 0;
         self.s1.clear();
-        self.s3.clear();
+        self.layer_name.clear();
+        self.mtext_pre.clear();
         self.app.clear();
         self.wire.clear();
         self.want_wire = false;
@@ -487,24 +531,29 @@ impl EntityBuf {
     fn push(&mut self, code: i32, val: &[u8]) {
         match code {
             8 => {
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
-                self.s3 = b;
+                self.layer_name = decode_text(trim(val), self.utf8_mode);
             }
             2 if self.kind == K_INSERT => {
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
-                self.block_name = b;
+                self.block_name = decode_text(trim(val), self.utf8_mode);
+            }
+            1000 if self.kind == K_NONE => {
+                let _ = val;
+            }
+            2 if self.kind == K_BLOCK => {
+                self.block_name = decode_text(trim(val), self.utf8_mode);
             }
             5 => self.handle = parse_hex_u32(val),
+            // ТЕКСТ НЕ ТРИМИТСЯ: в DXF пробелы по краям значимы, а при обрезке
+            // фрагменты MTEXT слипались («текстапродолжение»). Убираем только \r.
             1 => {
                 self.s1.clear();
-                cp1251_to_utf8(trim(val), &mut self.s1);
+                let mut b = decode_text(strip_cr(val), self.utf8_mode);
+                self.s1.append(&mut b);
             }
+            // MTEXT приходит фрагментами до 250 символов (код 3), последний — кодом 1
             3 => {
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
-                self.s3.extend_from_slice(&b);
+                let mut b = decode_text(strip_cr(val), self.utf8_mode);
+                self.mtext_pre.append(&mut b);
             }
             10 => self.set_coord(0, parse_f64(val)),
             20 => self.set_coord(1, parse_f64(val)),
@@ -530,8 +579,7 @@ impl EntityBuf {
                 self.want_wire = false;
             }
             1000 => {
-                let mut b = Vec::new();
-                cp1251_to_utf8(trim(val), &mut b);
+                let mut b = decode_text(trim(val), self.utf8_mode);
                 if self.app == b"DXFSIGN" {
                     if b == b"WIRE" {
                         self.want_wire = true;
@@ -678,19 +726,19 @@ fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
         K_LINE => {
             let a = doc.push_point(e.coord[0].1, e.coord[1].1);
             let b = doc.push_point(e.coord[3].1, e.coord[4].1);
-            let layer = doc.layer_index(&e.s3);
+            let layer = doc.layer_index(&e.layer_name);
             doc.segs.push(Seg { a, b, layer });
         }
         K_CIRCLE => {
             let c = doc.push_point(e.coord[0].1, e.coord[1].1);
-            let layer = doc.layer_index(&e.s3);
+            let layer = doc.layer_index(&e.layer_name);
             doc.circles.push(Circle { c, r: e.height.abs(), layer });
         }
         K_ARC => {
             // дуга показывается как окружность целиком: честное упрощение скелета,
             // в отчёте помечено; важно, что она ВИДНА, а не пропущена
             let c = doc.push_point(e.coord[0].1, e.coord[1].1);
-            let layer = doc.layer_index(&e.s3);
+            let layer = doc.layer_index(&e.layer_name);
             doc.circles.push(Circle { c, r: e.height.abs(), layer });
         }
         K_LWPOLY | K_SPLINE => {
@@ -700,7 +748,7 @@ fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
                     let i = doc.push_point(x, y);
                     doc.poly_verts.push(i);
                 }
-                let layer = doc.layer_index(&e.s3);
+                let layer = doc.layer_index(&e.layer_name);
                 doc.polys.push(Poly {
                     first,
                     len: e.verts.len() as u32,
@@ -716,14 +764,16 @@ fn finish_entity(e: &mut EntityBuf, doc: &mut Doc, stats: &mut ParseStats) {
                     let i = doc.push_point(x, y);
                     doc.poly_verts.push(i);
                 }
-                let layer = doc.layer_index(&e.s3);
+                let layer = doc.layer_index(&e.layer_name);
                 doc.polys.push(Poly { first, len: e.verts.len() as u32, closed: true, layer });
             }
         }
         K_TEXT | K_MTEXT => {
             let pos = doc.push_point(e.coord[0].1, e.coord[1].1);
-            let layer = doc.layer_index(&e.s3);
-            let cleaned = clean_text(&e.s1);
+            let layer = doc.layer_index(&e.layer_name);
+            let mut full = e.mtext_pre.clone();
+            full.extend_from_slice(&e.s1);
+            let cleaned = clean_text(&full);
             let (s, _) = doc.arena.push(&cleaned);
             let (wr, _) = doc.arena.push(&e.wire);
             let idx = doc.texts.len();
@@ -772,6 +822,9 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
     let mut saw_acadver = false;
     let mut blocks: Vec<(String, Doc)> = Vec::new();
     let mut cur_block: Option<(String, Doc)> = None;
+    /// UTF-8-режим включается для DXF 2007+ (AC1021 и новее). Решается по $ACADVER,
+    /// который всегда идёт в HEADER до ENTITIES.
+    let mut utf8_mode = false;
     // состояние старой полилинии (POLYLINE ... VERTEX ... SEQEND)
     let mut poly_pts: Vec<(f64, f64)> = Vec::new();
     let mut poly_layer: u16 = 0;
@@ -807,7 +860,7 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
                     K_POLYLINE => {
                         poly_pts.clear();
                         poly_closed = (cur.flags & 1) != 0;
-                        let name_bytes = cur.s3.clone();
+                        let name_bytes = cur.layer_name.clone();
                         poly_layer = if let Some((_, bdoc)) = cur_block.as_mut() {
                             bdoc.layer_index(&name_bytes)
                         } else {
@@ -857,6 +910,7 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
             }
             if name.eq_ignore_ascii_case(b"BLOCK") {
                 cur.reset();
+                cur.utf8_mode = utf8_mode;
                 cur.set_kind(b"BLOCK");
                 continue;
             }
@@ -871,6 +925,7 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
                 continue;
             }
             cur.reset();
+            cur.utf8_mode = utf8_mode;
             cur.set_kind(name);
             continue;
         }
@@ -906,6 +961,9 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
                         doc.dxf_version.clear();
                         doc.dxf_version.push_str(&String::from_utf8_lossy(val_t));
                         saw_acadver = true;
+                        // AC1021 = AutoCAD 2007: с него DXF пишется в UTF-8
+                        let v = String::from_utf8_lossy(val_t).to_string();
+                        utf8_mode = v.as_str() >= "AC1021";
                     } else if var == "$DWGCODEPAGE" && code == 3 {
                         doc.codepage.clear();
                         doc.codepage.push_str(&String::from_utf8_lossy(val_t));
@@ -934,24 +992,26 @@ pub fn parse(data: &[u8], doc: &mut Doc) -> Result<ParseStats> {
             Sec::Blocks => {
                 // внутри BLOCK: имя блока (код 2 сразу после 0 BLOCK) и его сущности
                 if cur.kind == K_BLOCK && code == 2 && cur_block.is_none() {
-                    // это имя блока, а не слой
-                    cp1251_to_utf8(val_t, &mut scratch);
-                    let name = String::from_utf8_lossy(&scratch).to_string();
+                    // имя блока — по кодировке файла (UTF-8 для 2007+, иначе CP1251),
+                    // иначе вставки в UTF-8-файлах не находили свой блок
+                    let bytes = decode_text(trim(val), utf8_mode);
+                    let name = String::from_utf8_lossy(&bytes).to_string();
                     cur_block = Some((name, Doc::with_capacity(64)));
                     continue;
                 }
                 if cur.kind != K_NONE {
-                    cur.push(code, val_t);
+                    cur.push(code, val);
                     if cur.kind == K_BLOCK && code == 2 && cur_block.is_none() {
-                        cp1251_to_utf8(val_t, &mut scratch);
-                        let name = String::from_utf8_lossy(&scratch).to_string();
+                        let bytes = decode_text(trim(val), utf8_mode);
+                        let name = String::from_utf8_lossy(&bytes).to_string();
                         cur_block = Some((name, Doc::with_capacity(64)));
                     }
                 }
             }
             Sec::Entities => {
                 if cur.kind != K_NONE {
-                    cur.push(code, val_t);
+                    // СЫРОЕ значение: trim срезал пробелы по краям текста
+                    cur.push(code, val);
                 }
             }
             Sec::None => {}
@@ -1002,6 +1062,9 @@ fn entity_kind_name(kind: u8) -> &'static [u8] {
 /// Второй проход только по INSERT: так вставки разворачиваются независимо от
 /// порядка определений блоков в файле. O(N) по тегам ENTITIES.
 fn expand_all_inserts(data: &[u8], doc: &mut Doc, blocks: &[(String, Doc)], stats: &mut ParseStats) {
+    // Режим кодировки вычисляем из версии, а не берём по умолчанию: иначе имена
+    // блоков в UTF-8-файлах декодировались как CP1251 и вставки не находились.
+    let utf8_mode = doc.dxf_version.as_str() >= "AC1021";
     // Ранний выход по `blocks.is_empty()` был ошибкой: тогда INSERT без определений
     // вообще не попадал в статистику, и «пустой чертёж» оставался необъяснённым.
     let mut r = TagReader::new(data);
@@ -1037,6 +1100,7 @@ fn expand_all_inserts(data: &[u8], doc: &mut Doc, blocks: &[(String, Doc)], stat
             }
             if matches!(sec, Sec::Entities) {
                 cur.reset();
+                cur.utf8_mode = utf8_mode;
                 cur.set_kind(name);
             }
             continue;
@@ -1337,6 +1401,52 @@ mod tests {
             doc.segs.len(), doc.circles.len(), doc.polys.len(), doc.texts.len(),
             st.total_entities, st.by_type, st.sections
         );
+    }
+
+    /// UTF-8 DXF (AutoCAD 2007+) с кириллицей и MTEXT, разбитым на фрагменты 3+1.
+    /// Раньше: фрагменты кода 3 шли в имя слоя, а кириллица декодировалась как CP1251.
+    #[test]
+    fn utf8_cyrillic_and_mtext_chunks() {
+        let src = concat!(
+            "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1021\n9\n$DWGCODEPAGE\n3\nANSI_1251\n0\nENDSEC\n",
+            "0\nSECTION\n2\nENTITIES\n",
+            "0\nTEXT\n8\nЭЛ-ТЕКСТ\n10\n0.0\n20\n0.0\n40\n5.0\n1\nЩИТ НИЗКОВОЛЬТНЫЙ\n",
+            "0\nMTEXT\n8\nЭЛ-ТЕКСТ\n10\n0.0\n20\n20.0\n40\n5.0\n",
+            "3\nПервая часть фрагмента\n",
+            "3\nвторая часть\n",
+            "1\n и конец\\Pвторая строка\n",
+            "0\nENDSEC\n0\nEOF\n"
+        );
+        let mut doc = Doc::with_capacity(64);
+        parse(src.as_bytes(), &mut doc).unwrap();
+        assert_eq!(doc.texts.len(), 2);
+        let t0 = String::from_utf8_lossy(doc.arena_get(doc.texts[0].s)).to_string();
+        assert_eq!(t0, "ЩИТ НИЗКОВОЛЬТНЫЙ", "кириллица UTF-8 должна читаться как есть");
+        let t1 = String::from_utf8_lossy(doc.arena_get(doc.texts[1].s)).to_string();
+        assert!(t1.starts_with("Первая часть фрагмента"), "фрагменты кода 3 потеряны: {}", t1);
+        assert!(t1.contains("вторая часть"), "{}", t1);
+        assert!(t1.contains("и конец"), "{}", t1);
+        assert!(!t1.contains("\\P"), "код \\P не вычищен: {}", t1);
+        // слой не должен содержать текст MTEXT
+        let layer = doc.layers.get(doc.texts[1].layer as usize).map(|l| String::from_utf8_lossy(doc.arena_get(l.name)).to_string()).unwrap_or_default();
+        assert_eq!(layer, "ЭЛ-ТЕКСТ", "в имя слоя попал текст: {}", layer);
+    }
+
+    /// Старый DXF (AC1015) в CP1251: кириллица обязана прочитаться.
+    #[test]
+    fn cp1251_cyrillic_in_old_version() {
+        let mut src = Vec::new();
+        src.extend_from_slice(b"0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1015\n9\n$DWGCODEPAGE\n3\nANSI_1251\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nTEXT\n8\n");
+        src.extend_from_slice(&[0xDD, 0xCB, 0x2D, 0xD2, 0xC5, 0xCA, 0xD1, 0xD2]); // "ЭЛ-ТЕКСТ"
+        src.extend_from_slice(b"\n10\n0.0\n20\n0.0\n40\n5.0\n1\n");
+        src.extend_from_slice(&[0xD9, 0xC8, 0xD2]); // "ЩИТ" в CP1251
+        src.extend_from_slice(b"\n0\nENDSEC\n0\nEOF\n");
+        let mut doc = Doc::with_capacity(32);
+        parse(&src, &mut doc).unwrap();
+        assert_eq!(doc.texts.len(), 1);
+        assert_eq!(String::from_utf8_lossy(doc.arena_get(doc.texts[0].s)), "ЩИТ");
+        let layer = doc.layers.get(doc.texts[0].layer as usize).map(|l| String::from_utf8_lossy(doc.arena_get(l.name)).to_string()).unwrap_or_default();
+        assert_eq!(layer, "ЭЛ-ТЕКСТ");
     }
 
     #[test]

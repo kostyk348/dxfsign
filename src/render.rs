@@ -147,6 +147,103 @@ impl Framebuffer {
         }
     }
 
+    /// Отрезок, отсечённый по прямоугольнику (Коэн–Сазерленд): внутри цикла нет
+    /// проверок границ, только запись. Это главный ускоритель кадра на чертежах
+    /// с десятками тысяч линий.
+    pub fn line_clipped(&mut self, mut x0: i32, mut y0: i32, mut x1: i32, mut y1: i32, color: u32, rect: (i32, i32, i32, i32)) {
+        let (rx0, ry0, rx1, ry1) = rect;
+        const INSIDE: u8 = 0;
+        const LEFT: u8 = 1;
+        const RIGHT: u8 = 2;
+        const BOTTOM: u8 = 4;
+        const TOP: u8 = 8;
+        fn code(x: i32, y: i32, rx0: i32, ry0: i32, rx1: i32, ry1: i32) -> u8 {
+            let mut c = 0u8;
+            if x < rx0 {
+                c |= 1;
+            } else if x > rx1 {
+                c |= 2;
+            }
+            if y < ry0 {
+                c |= 4;
+            } else if y > ry1 {
+                c |= 8;
+            }
+            c
+        }
+        let mut c0 = code(x0, y0, rx0, ry0, rx1, ry1);
+        let mut c1 = code(x1, y1, rx0, ry0, rx1, ry1);
+        loop {
+            if c0 | c1 == INSIDE {
+                break;
+            }
+            if c0 & c1 != 0 {
+                return; // целиком снаружи
+            }
+            let c = if c0 != 0 { c0 } else { c1 };
+            let (mut x, mut y) = if c0 != 0 { (x0, y0) } else { (x1, y1) };
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            if c & TOP != 0 {
+                if dy == 0 {
+                    return;
+                }
+                x = x0 + (rx0 - y0) * dx / dy;
+                y = ry0;
+            } else if c & BOTTOM != 0 {
+                if dy == 0 {
+                    return;
+                }
+                x = x0 + (ry1 - y0) * dx / dy;
+                y = ry1;
+            } else if c & RIGHT != 0 {
+                if dx == 0 {
+                    return;
+                }
+                y = y0 + (rx1 - x0) * dy / dx;
+                x = rx1;
+            } else if c & LEFT != 0 {
+                if dx == 0 {
+                    return;
+                }
+                y = y0 + (rx0 - x0) * dy / dx;
+                x = rx0;
+            }
+            if c == c0 {
+                x0 = x;
+                y0 = y;
+                c0 = code(x0, y0, rx0, ry0, rx1, ry1);
+            } else {
+                x1 = x;
+                y1 = y;
+                c1 = code(x1, y1, rx0, ry0, rx1, ry1);
+            }
+        }
+        // обе точки внутри прямоугольника => индексы валидны, проверки не нужны
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx - dy;
+        let (mut x, mut y) = (x0, y0);
+        let w = self.w as i32;
+        loop {
+            let idx = (y as usize) * (w as usize) + (x as usize);
+            self.px[idx] = color;
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 > -dy {
+                err -= dy;
+                x += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
     /// Окружность: O(r) на четверть через симметрию (8 точек за шаг).
     pub fn circle(&mut self, cx: i32, cy: i32, r: i32, color: u32) {
         if r <= 0 {
@@ -552,6 +649,16 @@ pub struct Renderer {
     pub points_cap: usize,
     /// Запас под строки, которые рисуются на канве (ограничен, см. `Overflow`).
     pub text_draw_cap: usize,
+    /// Сколько надписей реально рисуем за кадр. Реальные чертежи содержат десятки
+    /// тысяч TEXT, и GDI-вызов на каждую превращает кадр в «зависание».
+    pub text_budget: usize,
+    /// Сколько надписей нарисовано в последнем кадре (для статуса и LOD).
+    pub texts_drawn: usize,
+    /// Шаг отрисовки геометрии: 1 — все отрезки, 2/4/8 — прореживание на дальнем
+    /// плане, чтобы кадр оставался отзывчивым на очень больших чертежах.
+    pub seg_step: usize,
+    /// Длительность последнего кадра, мс (адаптация шага и статус).
+    pub frame_ms: f32,
 }
 
 impl Renderer {
@@ -562,6 +669,10 @@ impl Renderer {
             sy: vec![0; points_cap],
             points_cap,
             text_draw_cap: 4096,
+            text_budget: 1200,
+            texts_drawn: 0,
+            seg_step: 1,
+            frame_ms: 0.0,
         }
     }
 
@@ -580,6 +691,7 @@ impl Renderer {
             return Err(RenderError::Overflow { need: doc.xs.len(), have: self.points_cap });
         }
         let (vw0, vh0) = (w - swiss::LEFT_W - swiss::RIGHT_W, h - swiss::TOP_H - swiss::STATUS_H);
+        let frame_t0 = std::time::Instant::now();
         let vx = swiss::LEFT_W;
         let vy = swiss::TOP_H;
 
@@ -596,17 +708,17 @@ impl Renderer {
         ui.backend = backend;
         ui.entities = doc.entity_count() as u32;
 
-        // --- геометрия
-        for s in &doc.segs {
+        // --- геометрия: сначала отсечение по области канвы (O(1) на сущность).
+        // Без этого 150 тыс. линий за пределами вида всё равно шли в растеризатор.
+        let (cx0, cy0, cx1, cy1) = (vx - 8, vy - 8, vx + vw0 + 8, vy + vh0 + 8);
+        let on_screen = |x: i32, y: i32| -> bool { x >= cx0 && x <= cx1 && y >= cy0 && y <= cy1 };
+        let step = self.seg_step.max(1);
+        let canvas = (0, swiss::TOP_H, w - swiss::RIGHT_W - 1, h - swiss::STATUS_H - 1);
+        for s in doc.segs.iter().step_by(step) {
             let (i, j) = (s.a as usize, s.b as usize);
-            self.fb.line(
-                vx + self.sx[i],
-                vy + self.sy[i],
-                vx + self.sx[j],
-                vy + self.sy[j],
-                swiss::INK,
-            );
+            self.fb.line_clipped(vx + self.sx[i], vy + self.sy[i], vx + self.sx[j], vy + self.sy[j], swiss::INK, canvas);
         }
+        let _ = (cx0, cy0, cx1, cy1);
         for p in &doc.polys {
             for k in 0..p.len.saturating_sub(1) {
                 let (a, b) = (
@@ -626,14 +738,34 @@ impl Renderer {
         for c in &doc.circles {
             let i = c.c as usize;
             let r = (c.r * cam.scale).max(1.0) as i32;
-            self.fb.circle(vx + self.sx[i], vy + self.sy[i], r, swiss::INK);
+            let (px, py) = (vx + self.sx[i], vy + self.sy[i]);
+            if px + r < cx0 || px - r > cx1 || py + r < cy0 || py - r > cy1 {
+                continue;
+            }
+            self.fb.circle(px, py, r, swiss::INK);
         }
 
-        // --- надписи: то, что правится; выделенная — красной рамкой
+        // --- надписи: то, что правится; выделенная — красной рамкой.
+        // Бюджет на кадр: выделенная надпись рисуется всегда, остальные — пока хватает
+        // бюджета; сверх бюджета ставятся засечки (LOD), и это видно в статусе.
+        let budget = self.text_budget.max(64);
         let mut drawn = 0usize;
+        let mut ticks = 0usize;
         for (ti, t) in doc.texts.iter().enumerate() {
             if drawn >= self.text_draw_cap {
                 break;
+            }
+            let selected_now = ui.selected_text == Some(ti);
+            if drawn >= budget && !selected_now {
+                let i = t.pos as usize;
+                if i < self.sx.len() {
+                    let (px, py) = (vx + self.sx[i], vy + self.sy[i]);
+                    if on_screen(px, py) {
+                        self.fb.fill_rect(px - 2, py - 2, 4, 4, swiss::MUTED);
+                        ticks += 1;
+                    }
+                }
+                continue;
             }
             drawn += 1;
             let i = t.pos as usize;
@@ -663,6 +795,17 @@ impl Renderer {
             if t.kind == TEXT_KIND_MTEXT {
                 self.fb.fill_rect(x - 8, y - 4, 4, 4, swiss::MUTED);
             }
+        }
+
+        self.texts_drawn = drawn;
+        let _ = ticks;
+        // --- адаптация: держим кадр в пределах ~30 мс. На чертеже с 150 тыс. линий
+        // полный проход даёт 100+ мс (ощущается как зависание), поэтому на медленном
+        // кадре прореживаем геометрию и честно показываем это в статусе.
+        if self.frame_ms > 34.0 && self.seg_step < 8 {
+            self.seg_step *= 2;
+        } else if self.frame_ms < 12.0 && self.seg_step > 1 {
+            self.seg_step /= 2;
         }
 
         // --- верхняя полоса: имя файла + кнопки тулбара
@@ -864,6 +1007,7 @@ impl Renderer {
         tp.text(&mut self.fb, w - swiss::MARGIN - fw, h - swiss::STATUS_H + 13, swiss::T_CAPTION, false, swiss::MUTED, fname);
 
         // --- модальный запрос номера провода и комментария
+        self.frame_ms = frame_t0.elapsed().as_secs_f32() * 1000.0;
         if ui.help_open {
             let fields: [(&str, &str, bool); 5] = [
                 ("МЫШЬ", "клик — выбрать · 2×клик — править · колесо — зум", false),

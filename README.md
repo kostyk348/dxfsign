@@ -1,117 +1,122 @@
 # dxfsign
 
-Просмотр и правка DXF на сетевом диске, где **каждое сохранение подписано и отправлено письмом**:
-рабочий файл перезаписывается, прежняя версия уезжает в `_VERSIONS`, рядом ложится `.txt`
-с перечнем изменений, а в спул — готовый `.eml` с обоими состояниями чертежа и HMAC-подписью.
+**English** · [Русский](README.ru.md)
 
-Один исполняемый файл, **ноль зависимостей**, без .NET и VC++ redist.
+View and edit DXF drawings on a network drive where **every save is signed and mailed**: the working
+file is overwritten, the previous version is rotated into `_VERSIONS`, a `.txt` change list is written
+next to the drawing, and a ready-to-send `.eml` (both drawing states + HMAC signature) is dropped into
+a spool directory.
 
-**Версия 1.0.0** — [скачать сборку](../../releases/latest):
+A single executable, **zero dependencies**, no .NET, no VC++ redist.
 
-| Файл | Для чего |
+![window](docs/img/frame.png)
+
+Left — network-drive catalog and the list of drawing labels (click selects, double-click edits),
+centre — canvas with hover highlight, right — label properties and the `.eml` spool path.
+Top — toolbar: OPEN · CATALOG · EDIT · COMMENT · SAVE · FIT · HELP (`F1`).
+
+## Download
+
+**Version 1.0.3** — [latest release](../../releases/latest):
+
+| File | Target |
 |---|---|
-| `dxfsign-1.0.0-win64.exe` | Windows 10 / 11 |
-| `dxfsign-1.0.0-win7-x64.exe` | Windows 7 SP1 (нужен KB2999226, Universal C Runtime) |
-| `SHA256SUMS.txt` | контрольные суммы; проверка: `certutil -hashfile <файл> SHA256` |
+| `dxfsign-1.0.3-win64.exe` | Windows 10 / 11 |
+| `dxfsign-1.0.3-win7-x64.exe` | Windows 7 SP1 + KB2999226 (Universal C Runtime) |
+| `SHA256SUMS.txt` | verify with `certutil -hashfile <file> SHA256` |
 
 ```bat
 dxfsign.exe --version
 ```
 
-![окно](docs/img/frame.png)
+## What it does
 
-Слева — каталог сетевого диска и список надписей чертежа (клик выбирает, двойной клик правит),
-в центре — канва с подсветкой под курсором, справа — свойства надписи и путь спула `.eml`.
-Сверху — тулбар: ОТКРЫТЬ · КАТАЛОГ · ПРАВИТЬ · КОММЕНТ. · СОХРАНИТЬ · ВПИСАТЬ · СПРАВКА (`F1`).
+* reads ASCII DXF: `LINE`, `CIRCLE`, `ARC`, `LWPOLYLINE`, legacy `POLYLINE`+`VERTEX`, `SPLINE`,
+  `SOLID`, `TEXT`/`ATTRIB`, `MTEXT` (formatting codes stripped), **`BLOCKS` + `INSERT`**
+  (scale, rotation, layer-0 inheritance). Encoding: UTF-8 for DXF 2007+ (`AC1021`), CP1251 otherwise;
+* writes back `LINE`, `CIRCLE`, `LWPOLYLINE`, `TEXT`, `MTEXT` (blocks are expanded to geometry on
+  save — a named limitation);
+* edits **label text** — the primary workflow: click, `F2`, type, `Enter`;
+* after the edit it **requires a wire number** — the change is not applied without it. The number is
+  stored in the drawing itself as XData (`1001 DXFSIGN`) and sent in the mail;
+* accepts a **free-form comment** that goes into the proposed-changes list, the `.txt` and the `.eml`;
+* save protocol: previous file → `_VERSIONS/<name>__<YYYYMMDD-HHMMSS>_<seq>.dxf`; working file
+  replaced atomically; `.txt` next to it; `.eml` with three attachments (new `.dxf`, previous `.dxf`,
+  `.txt`), HMAC-SHA256 over a canonical string, anchor row in `_VERSIONS/index.tsv`;
+* network-drive catalog in an INI file with an in-app **catalog editor** (`F4`, system folder picker),
+  file open via `Ctrl+O` or drag-and-drop;
+* **Win32 window without a GUI framework**: toolbar, hover and selection highlight, wheel zoom
+  **anchored under the cursor**, middle/right-button pan, list scrolling, `F1` help;
+* **performance**: frames allocate nothing (asserted in tests), AVX2 projection with runtime dispatch
+  and scalar baseline (×15 on 42 500 points), screen-space segment clipping, adaptive LOD — a
+  150 000-segment drawing renders in **20 ms** instead of 109 ms.
 
-## Что умеет
+![modal step: wire number and comment](docs/img/modal-comment.png)
 
-* читает ASCII DXF: `LINE`, `CIRCLE`, `ARC`, `LWPOLYLINE`, старая `POLYLINE`+`VERTEX`, `SPLINE`,
-  `SOLID`, `TEXT`/`ATTRIB`, `MTEXT` (с чисткой кодов форматирования), **`BLOCKS` + `INSERT`**
-  (масштаб, поворот, наследование слоя «0»); кодировка CP1251 по `$DWGCODEPAGE`;
-* пишет обратно `LINE`, `CIRCLE`, `LWPOLYLINE`, `TEXT`, `MTEXT` (блоки при записи разворачиваются
-  в геометрию — это названное ограничение);
-* правит **текст надписи** — это главный сценарий: выбор кликом, `F2`, ввод, `Enter`;
-* после правки **обязательно спрашивает номер провода** — без него правка не применяется;
-* позволяет оставить **свободный комментарий**, он идёт в перечень предлагаемых изменений;
-* номер провода уезжает не только в письмо, но и в **XData самой сущности** (`1001 DXFSIGN`);
-* при сохранении: старый файл → `_VERSIONS/<имя>__<YYYYMMDD-HHMMSS>_<seq>.dxf`,
-  рабочий перезаписывается атомарно, `.txt` рядом, `.eml` в спул, якорь в `_VERSIONS/index.tsv`;
-* навигация по папкам сетевого диска — по вручную ведомому каталогу в INI, с **редактором каталога**
-  прямо в окне (`F4`: имя/путь, `F5` — системный выбор папки, `Ins`/`Del`, `Enter` — запись в ini);
-* открытие файла — `Ctrl+O` (системный диалог), путь спула `.eml` и результат последнего сохранения
-  показаны в правой панели;
-* кадр рисуется **без единой аллокации** (проверяется тестом), проекция — **AVX2** с рантайм-детектом
-  и скалярным базовым путём (×15 на 42 500 точках).
-
-![модальный шаг](docs/img/modal.png)
-![фокус на комментарии](docs/img/modal-comment.png)
-
-## Быстрый старт
+## Quick start
 
 ```bat
-:: окно с демонстрационным чертежом
+:: window with the demo drawing
 dxfsign.exe
 
-:: окно с файлом
-dxfsign.exe open Z:\projects\itp-3\plan.dxf
+:: open a specific file (or just drag it into the window)
+dxfsign.exe "\\srv\project\switchboard.dxf"
 
-:: консольный сценарий
-dxfsign.exe report plan.dxf      :: что внутри файла: секции, блоки, типы сущностей
-dxfsign.exe inspect plan.dxf
-dxfsign.exe edit plan.dxf --idx 1 --text "QF1 Ввод 1 (заменён)" --wire W-101 --comment "по замечанию ПТО"
-dxfsign.exe save plan.dxf.edited.dxf --config dxfsign.ini --working plan.dxf
+:: what is inside a file — sections, entity types, blocks, inserts
+dxfsign.exe report drawing.dxf
 
-:: кадр в BMP (для отчёта или проверки вёрстки)
-dxfsign.exe snapshot plan.dxf --out кадр.bmp --modal
+:: console workflow
+dxfsign.exe inspect drawing.dxf
+dxfsign.exe edit drawing.dxf --idx 1 --text "QF1 Incoming 1 (replaced)" --wire W-101 --comment "per review"
+dxfsign.exe save drawing.dxf.edited.dxf --config dxfsign.ini --working drawing.dxf
 
-:: замеры
-dxfsign.exe bench plan.dxf --iters 500
-dxfsign.exe alloc plan.dxf --frames 200
+:: measurements
+dxfsign.exe frame-bench drawing.dxf --frames 20
+dxfsign.exe bench drawing.dxf --iters 500
+dxfsign.exe alloc drawing.dxf --frames 200
 ```
 
-Управление в окне: **зум колесом под курсором**, панорама средней/правой кнопкой, прокрутка списка
-надписей колесом над левой панелью, подсветка надписи при наведении; **все поля и кнопки модалки
-кликаются мышью** (клик по полю ставит фокус,
-клик по «ПРИНЯТЬ» применяет), плюс клавиши: `F2` правка · `F3` комментарий · `Tab` следующее поле ·
-`Enter` принять · `Esc` отмена/выход · `Ctrl+O` открыть файл · `F4` редактор каталога ·
-`Ctrl+S` сохранить с версией и письмом · `+/−`/колесо масштаб · `F7` вписать.
+Mouse: click selects · double-click edits · wheel zooms under the cursor · middle/right button pans ·
+wheel over the left panel scrolls. Keys: `F2` edit · `F3` comment · `Tab` next field · `Enter` apply ·
+`Esc` cancel/exit · `Ctrl+O` open · `F4` catalog editor · `Ctrl+S` save with version and mail ·
+`+`/`-`/`PgUp`/`PgDn` zoom · `F7` fit · `F1` help.
 
-## Конфигурация
+## Configuration
 
 ```ini
 [app]
-to_addr      = owner@example.invalid   ; куда подписывать сохранения
+to_addr      = owner@example.invalid   ; where signed saves are mailed
 from_addr    = dxfsign@localhost
-spool_dir    = \\srv\scan\dxf\_SPOOL   ; спул писем (сетевой — доставку делает агент)
-versions_dir = _VERSIONS               ; подпапка версий рядом с чертежом
-tz_offset    = 180                     ; минуты, MSK = 180
-keep_versions= 0                       ; 0 = хранить всё
-key_env      = DXFSIGN_KEY             ; ключ HMAC из окружения (не из файла!)
+spool_dir    = \\srv\\scan\\dxf\\_SPOOL   ; mail spool (network share — a delivery agent picks it up)
+versions_dir = _VERSIONS               ; version folder next to the drawing
+tz_offset    = 180                     ; minutes, MSK = 180
+keep_versions= 0                       ; 0 = keep everything
+key_env      = DXFSIGN_KEY             ; HMAC key from the environment (never from the file)
 require_wire = true
 
 [catalog]
-ИТП-3 = \\srv\projects\itp-3\dxf
-Щиты  = \\srv\projects\shields
+SW-3  = \\srv\\projects\\sw-3\\dxf
+Panels = \\srv\\projects\\panels
 ```
 
-## Что проверено, а что нет
+## Verified / not verified
 
-`cargo test` — 49 тестов: SIMD-ядро против скаляра, DXF round-trip, CP1251, правка без номера
-провода, комментарии, RFC 4231/4648/2047, **кадр без аллокаций (200 кадров → 0)**, сквозной
-сценарий с ротацией версий и разбор `.eml` независимым парсером.
+`cargo test` — **57 tests**: SIMD against scalar, DXF round-trip, CP1251 and UTF-8 Cyrillic, MTEXT
+chunks, blocks with rotation and scale, legacy polylines, splines, editing without a wire number,
+comments, RFC 4231/4648/2047, **zero allocations per frame**, modal click geometry, end-to-end save
+with version rotation and independent `.eml` parsing (Python `email`).
 
-**Не проверено:** реальная отправка по SMTP (не реализована намеренно — письмо кладётся в спул),
-работа на настоящей SMB-шаре, запуск на Windows 7 (нет машины), IME-ввод, блоки `INSERT`/`DIMENSION`.
+**Not verified:** real SMTP delivery (the mail is written to a spool by design), a real SMB share,
+running on an actual Windows 7 machine, IME and clipboard in input fields, `HATCH`/`DIMENSION`/
+`LEADER`/`XREF` rendering (counted and reported, not drawn), binary DXF.
 
 ## Windows 7
 
-Один exe, 624 КБ, импортирует только `KERNEL32`, `GDI32`, UCRT (`api-ms-win-crt-*`), `ntdll`.
-На Win7 SP1 нужен **KB2999226** (Universal C Runtime) — стандартное обновление; без него не
-стартует. Собрать без UCRT можно msvcrt-сборкой Mingw-w64 или MSVC + Windows 7 SDK — на машине
-разработки таких тулчейнов нет, поэтому это не заявляется как проверенное.
-
-Сборка под Win7 (проверена на этом коде — собирается, окно и полный E2E работают):
+The win7 build is produced with rustc 1.77.2 — the last one whose standard library supports Windows 7.
+Imports: `KERNEL32`, `USER32`, `GDI32`, `comdlg32`, `SHELL32`, `ole32`, `ntdll` + UCRT; no
+`vcruntime`, no `api-ms-win-core-*` (Win10-only). UCRT requires **KB2999226** on Windows 7 SP1.
+The win64 build is produced with current stable and **does** import `api-ms-win-core-synch-l1-2-0`,
+so it is Windows 10/11 only.
 
 ```bat
 rustup toolchain install 1.77.2
@@ -119,26 +124,22 @@ rustup target add x86_64-pc-windows-gnu --toolchain 1.77.2
 cargo +1.77.2 build --release --target x86_64-pc-windows-gnu
 ```
 
-1.77.2 — последний rustc, у которого std официально работает на Win7 (с 1.78 минимум Windows 10).
-Импорты готового exe: `KERNEL32`, `USER32`, `GDI32`, `comdlg32`, `SHELL32`, `ole32`, `ntdll` + UCRT —
-все есть на Win7 SP1, кроме UCRT (KB2999226).
+## Architecture
 
-## Устройство
-
-| модуль | роль |
+| module | role |
 |---|---|
-| `doc.rs` | DOP-модель: SoA-массивы точек/примитивов, индексы вместо указателей, журнал правок |
-| `dxf.rs` | разбор и запись ASCII DXF (тег-модель перенесена из `cadcraft/crates/dxf`, без зависимостей) |
-| `edit.rs` | автомат правки: ТЕКСТ → НОМЕР ПРОВОДА (обязателен) → КОММЕНТАРИЙ |
-| `save.rs` | протокол: ротация версии → атомарная перезапись → `.txt` → `.eml` → якорь |
+| `doc.rs` | DOP model: SoA point/primitive arrays, indices instead of pointers, change log |
+| `dxf.rs` | ASCII DXF read/write; blocks, inserts, legacy polylines, splines, text encodings |
+| `edit.rs` | edit state machine: TEXT → WIRE NUMBER (mandatory) → COMMENT |
+| `save.rs` | protocol: rotate version → atomic overwrite → `.txt` → `.eml` → chain anchor |
 | `eml.rs` | RFC 5322 + MIME multipart + RFC 2047 + base64 |
-| `ports.rs` | POP-контракты: `FileSource`, `Signer`, `MailTransport`, `VersionStore` |
-| `render.rs` | AVX2-проекция, растеризатор, раскладка Brutalism + Swiss (числами) |
-| `win32.rs` / `window.rs` | GDI-типографика и окно Win32 (без DirectX/WebView2) |
+| `ports.rs` | POP contracts: `FileSource`, `Signer`, `MailTransport`, `VersionStore` |
+| `render.rs` | AVX2 projection, rasteriser, Brutalism + Swiss layout (as numbers) |
+| `win32.rs` / `window.rs` / `dialogs.rs` | GDI typography, Win32 window, system dialogs |
 
-Полное техническое решение — [`docs/spec.md`](docs/spec.md): разбор требований, таблица
-противоречий, обоснование стека, архитектура, оценки O, план работ.
+Full technical solution (requirements, conflict table, stack rationale, O estimates, work plan):
+[`docs/spec.md`](docs/spec.md) (Russian).
 
-## Лицензия
+## License
 
 MIT OR Apache-2.0.

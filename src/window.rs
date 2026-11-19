@@ -442,8 +442,10 @@ fn hit_test_text(mx: i32, my: i32) -> Option<usize> {
         let x = vx + c.renderer.sx[pi];
         let y = vy + c.renderer.sy[pi];
         let px = ((t.height * c.cam.scale) as i32).clamp(13, 72);
-        let s = String::from_utf8_lossy(c.doc.arena_get(t.s)).to_string();
-        let w = c.painter.measure(px, false, &s).max(px);
+        // Ширину считаем АРИФМЕТИКОЙ, без GDI: measure() на каждую надпись при каждом
+        // движении мыши — это и было «зависание» на чертежах с тысячами TEXT.
+        let chars = c.doc.arena_get(t.s).len().max(1) as i32;
+        let w = (chars * px * 55 / 100).max(px);
         // запас 14 px по краям: попасть в строку высотой 6 единиц одним пикселем
         // было физически тяжело — мышью «ничего не кликалось»
         const SLOP: i32 = 14;
