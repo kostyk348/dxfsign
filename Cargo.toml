@@ -1,0 +1,19 @@
+[package]
+name = "dxfsign"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "DXF viewer/editor for a network drive: every save is signed and mailed as .eml, with a .txt change list"
+license = "MIT OR Apache-2.0"
+
+# Ноль зависимостей — осознанно: сборка на Win7-таргете (Tier 3, -Z build-std)
+# не должна тянуть crates.io-граф, который сам может требовать Win10 APIs.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+# Интринсики AVX2 выбираются рантайм-детектом (is_x86_feature_detected!), поэтому
+# target-cpu остаётся baseline: бинарь обязан жить на машинах без AVX2 (Westmere..Ivy).

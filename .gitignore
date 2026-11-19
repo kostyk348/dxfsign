@@ -1,0 +1,11 @@
+target/
+*.bmp
+*.exe
+*.pdb
+!docs/img/*.png
+_SPOOL/
+_VERSIONS/
+*.journal.tsv
+*.edited.dxf
+*.changes.txt
+dxfsign.ini
