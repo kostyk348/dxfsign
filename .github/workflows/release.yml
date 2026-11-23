@@ -54,7 +54,7 @@ jobs:
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
           Copy-Item target/x86_64-pc-windows-gnu/release/dxfsign.exe "dxfsign-$v-win7-x64.exe"
 
-      - name: Guard: imports
+      - name: "Guard: imports"
         shell: pwsh
         run: |
           $bad = 0
